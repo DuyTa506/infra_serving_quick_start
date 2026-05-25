@@ -1,5 +1,5 @@
 #!/bin/bash
-# Qwen3.6-35B-A3B LLM server — GPU 0+1 (TP=2), port 8011
+# Qwen3.6-35B-A3B-FP8 LLM server — GPU 0+1 (TP=2), port 8011
 # nginx proxies external :8001 → internal :8011
 # 0.90 GPU utilization for maximum KV cache / throughput
 set -a; source /workspace/.env; set +a
@@ -12,9 +12,9 @@ LOG=/workspace/logs/llm.log
 mkdir -p /workspace/logs
 
 echo "[$(date)] Starting LLM server on :8011 → external :8001 (GPU 0+1, TP=2)" | tee -a "$LOG"
-exec vllm serve Qwen/Qwen3.6-35B-A3B \
+exec vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --api-key "$API_KEY" \
-    --revision 995ad96eacd98c81ed38be0c5b274b04031597b0 \
+    --revision 95a723d08a9490559dae23d0cff1d9466213d989 \
     --host 0.0.0.0 \
     --port 8011 \
     --tensor-parallel-size 2 \
