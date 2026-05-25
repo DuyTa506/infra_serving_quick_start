@@ -1,0 +1,29 @@
+# API keys and secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Model cache (large binary files)
+models/
+
+# Log files
+logs/
+
+# Docker
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc cache
+.cache/
