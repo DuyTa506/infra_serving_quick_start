@@ -1,8 +1,8 @@
 version: "3.8"
 
-# GPU layout (2x A100 80GB):
-#   GPU 0 — LLM shard 0 + reranker  (LLM@0.75 → 60 GB, reranker@0.15 → 12 GB)
-#   GPU 1 — LLM shard 1 + embedding (LLM@0.75 → 60 GB, embedding@0.15 → 12 GB)
+# GPU layout (2x A100 80GB SXM — NVLink P2P enabled):
+#   GPU 0 — LLM shard 0 + reranker  (LLM@0.94 → ~75 GB, reranker@0.15 → 12 GB)
+#   GPU 1 — LLM shard 1 + embedding (LLM@0.94 → ~75 GB, embedding@0.15 → 12 GB)
 #
 # network_mode: host is required — dockerd runs without bridge networking (RunPod DinD).
 # Services bind directly to host ports: 8000 (embed), 8001 (llm), 8002 (rerank).
@@ -20,11 +20,10 @@ services:
       memlock: -1
       stack: 67108864
     volumes:
-      - /workspace/models:/root/.cache/huggingface
+      - ./models:/root/.cache/huggingface
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - API_KEY=${API_KEY:-}
-      - NCCL_P2P_DISABLE=1
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
     deploy:
       resources:
@@ -40,15 +39,16 @@ services:
       "--api-key", "${API_KEY:-}",
       "--revision", "95a723d08a9490559dae23d0cff1d9466213d989",
       "--tensor-parallel-size", "2",
-      "--max-model-len", "131072",
-      "--max-num-batched-tokens", "8192",
-      "--gpu-memory-utilization", "0.75",
+      "--max-model-len", "65536",
+      "--max-num-batched-tokens", "32768",
+      "--gpu-memory-utilization", "0.94",
+      "--max-num-seqs", "128",
+      "--enable-prefix-caching",
       "--reasoning-parser", "qwen3",
       "--enable-auto-tool-choice",
       "--tool-call-parser", "qwen3_coder",
       "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}",
       "--safetensors-load-strategy", "prefetch",
-      "--disable-custom-all-reduce",
       "--language-model-only",
       "--trust-remote-code"
     ]
@@ -62,7 +62,7 @@ services:
     network_mode: host
     ipc: host
     volumes:
-      - /workspace/models:/root/.cache/huggingface
+      - ./models:/root/.cache/huggingface
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - API_KEY=${API_KEY:-}
@@ -70,7 +70,7 @@ services:
       resources:
         reservations:
           devices:
-            # GPU 1 only — shares remaining ~20 GB after LLM shard
+            # GPU 1 only — shares remaining ~6 GB after LLM shard
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
@@ -95,7 +95,7 @@ services:
     network_mode: host
     ipc: host
     volumes:
-      - /workspace/models:/root/.cache/huggingface
+      - ./models:/root/.cache/huggingface
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - API_KEY=${API_KEY:-}
@@ -103,7 +103,7 @@ services:
       resources:
         reservations:
           devices:
-            # GPU 0 only — shares remaining ~20 GB after LLM shard
+            # GPU 0 only — shares remaining ~6 GB after LLM shard
             - driver: nvidia
               device_ids: ["0"]
               capabilities: [gpu]

@@ -6,7 +6,7 @@
 #   1. Install Docker (with nvidia runtime configured)
 #   2. Install NVIDIA Container Toolkit
 #   3. Install vLLM (latest) for native serving
-#   4. Create /workspace/models for persistent model cache
+#   4. Create models/ for persistent model cache
 #   5. Make all scripts executable
 
 set -e
@@ -80,11 +80,13 @@ else
 fi
 
 # ── 5. Workspace setup ────────────────────────────────────────────────────────
-echo "[5/5] Setting up /workspace..."
-mkdir -p /workspace/models /workspace/logs/pids
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "[5/5] Setting up project directories..."
+mkdir -p "$SCRIPT_DIR/models" "$SCRIPT_DIR/logs/pids"
 
 # Make all scripts executable
-chmod +x /workspace/*.sh
+chmod +x "$SCRIPT_DIR"/*.sh
 
 echo ""
 echo "=========================================="
@@ -96,12 +98,12 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits \
 echo ""
 echo " Next steps:"
 echo "   1. Create .env from template and set your API key + HF token:"
-echo "      cp /workspace/.env.example /workspace/.env"
-echo "      nano /workspace/.env   # set API_KEY and HF_TOKEN"
+echo "      cp .env.example .env"
+echo "      nano .env   # set API_KEY and HF_TOKEN"
 echo "   2. Start all services:"
-echo "      bash /workspace/start_all.sh"
+echo "      bash start_all.sh"
 echo "   3. Check status:"
-echo "      bash /workspace/status.sh"
+echo "      bash status.sh"
 echo ""
 echo " Ports:"
 echo "   8000 → BGE-Large embedding  (POST /v1/embeddings)"

@@ -1,16 +1,16 @@
 #!/bin/bash
 # Start all three vLLM services in the background.
-# Logs  → /workspace/logs/{llm,embedding,reranker}.log
-# PIDs  → /workspace/logs/pids/
+# Logs  → PROJECT/logs/{llm,embedding,reranker}.log
+# PIDs  → PROJECT/logs/pids/
 
 set -e
-mkdir -p /workspace/logs/pids
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$SCRIPTS_DIR/logs/pids"
 
 start_service() {
     local name=$1
     local script=$2
-    local pidfile=/workspace/logs/pids/${name}.pid
+    local pidfile="$SCRIPTS_DIR/logs/pids/${name}.pid"
 
     if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
         echo "[SKIP] $name already running (PID $(cat "$pidfile"))"
@@ -29,6 +29,6 @@ sleep 2
 start_service llm       "$SCRIPTS_DIR/start_llm.sh"
 
 echo ""
-echo "Logs:   tail -f /workspace/logs/{embedding,reranker,llm}.log"
+echo "Logs:   tail -f $SCRIPTS_DIR/logs/{embedding,reranker,llm}.log"
 echo "Status: bash $SCRIPTS_DIR/status.sh"
 echo "Stop:   bash $SCRIPTS_DIR/stop_all.sh"

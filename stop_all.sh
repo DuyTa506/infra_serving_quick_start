@@ -1,7 +1,8 @@
 #!/bin/bash
 # Stop all vLLM services — kills by PID file AND by process name to catch orphans
 
-PIDDIR=/workspace/logs/pids
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIDDIR="$SCRIPT_DIR/logs/pids"
 
 # Kill tracked PIDs
 for name in embedding reranker llm; do

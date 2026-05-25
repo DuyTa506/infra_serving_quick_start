@@ -1,6 +1,7 @@
 #!/bin/bash
 # Check health of all three vLLM services
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_URL="http://localhost"
 declare -A SERVICES=(
     [embedding]="$BASE_URL:8000"
@@ -8,7 +9,7 @@ declare -A SERVICES=(
     [reranker]="$BASE_URL:8002"
 )
 
-PIDDIR=/workspace/logs/pids
+PIDDIR="$SCRIPT_DIR/logs/pids"
 
 echo "=== Process status ==="
 for name in embedding llm reranker; do
