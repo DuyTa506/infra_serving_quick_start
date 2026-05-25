@@ -1,12 +1,14 @@
 # vLLM Serving Stack
 
-3 services on 2x A100 80GB:
+3 services on 2x A100-SXM4 80GB (NVLink):
 
 | Port | Service | Model |
 |------|---------|-------|
-| 8001 | LLM | Qwen/Qwen3.6-35B-A3B-FP8 |
+| 8001 | LLM | Qwen/Qwen3.6-35B-A3B-FP8 (TP=2, MTP, 64K ctx) |
 | 8000 | Embedding | BAAI/bge-large-en-v1.5 |
 | 8002 | Reranker | BAAI/bge-reranker-v2-m3 |
+
+**Performance:** ~5,300 tok/s peak, 128 CCU stable, 16K-context TTFB <10s at 32 CCU.
 
 ---
 
@@ -250,44 +252,63 @@ for item in r.json()["results"]:
 ### First time setup
 
 ```bash
-bash /workspace/setup.sh
-cp /workspace/.env.example /workspace/.env
+bash setup.sh
+cp .env.example .env
 # edit .env — set API_KEY and HF_TOKEN
 ```
 
 ### Start / Stop / Status
 
 ```bash
-bash /workspace/start_all.sh
-bash /workspace/status.sh
-bash /workspace/stop_all.sh
+bash start_all.sh
+bash status.sh
+bash stop_all.sh
 ```
 
 ### Logs
 
 ```bash
-tail -f /workspace/logs/llm.log
-tail -f /workspace/logs/embedding.log
-tail -f /workspace/logs/reranker.log
+tail -f logs/llm.log
+tail -f logs/embedding.log
+tail -f logs/reranker.log
 ```
+
+---
+
+## Benchmarking
+
+Three benchmark scripts included:
+
+```bash
+# Basic throughput (C=1,2,4,8)
+python3 bench.py
+
+# CCU stress test (C=1..64)
+python3 bench_ccu.py
+
+# Full stress: 128 CCU + long prompts + 32k output
+python3 bench_stress.py
+```
+
+All scripts hit `localhost:8001` with the API key from `.env`. Edit `API` and `KEY` at the top of each script to change target.
 
 ---
 
 ## GPU Layout
 
 ```
-GPU 0  →  LLM shard 0  (75% = 60 GB)  +  Reranker (15% = 12 GB)
-GPU 1  →  LLM shard 1  (75% = 60 GB)  +  Embedding (15% = 12 GB)
+GPU 0  →  LLM shard 0  (94% ≈ 75 GB)  +  Reranker (15% ≈ 12 GB)
+GPU 1  →  LLM shard 1  (94% ≈ 75 GB)  +  Embedding (15% ≈ 12 GB)
 ```
 
-LLM: TP=2, 128K context, MTP speculative decoding.
+LLM: TP=2, 64K context, MTP speculative decoding, NVLink P2P, prefix caching.
+Max batched tokens: 32,768. Max concurrent seqs: 128.
 
 ---
 
 ## Files
 
 ```
-/workspace/
 ├── .env                ← API key + HF token
 ├── .env.example        ← config template
 ├── setup.sh            ← one-shot setup
@@ -298,6 +319,9 @@ LLM: TP=2, 128K context, MTP speculative decoding.
 ├── start_embedding.sh
 ├── start_reranker.sh
 ├── docker-compose.yml
+├── bench.py            ← basic throughput benchmark
+├── bench_ccu.py        ← CCU stress test
+├── bench_stress.py     ← full stress (128 CCU, 16K ctx, 32K output)
 ├── llm/Dockerfile
 ├── embedding/Dockerfile
 ├── reranker/Dockerfile
