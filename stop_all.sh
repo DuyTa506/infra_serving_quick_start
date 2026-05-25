@@ -20,7 +20,7 @@ for name in embedding reranker llm; do
 done
 
 # Kill any orphaned vllm/VLLM processes not tracked by pidfiles
-ORPHANS=$(ps aux | grep -E "vllm serve|VLLM::Worker" | grep -v grep | awk '{print $2}')
+ORPHANS=$(ps aux | grep -E "vllm serve|VLLM::Worker|VLLM::EngineCore" | grep -v grep | awk '{print $2}')
 if [ -n "$ORPHANS" ]; then
     echo "[KILL] orphaned processes: $ORPHANS"
     echo "$ORPHANS" | xargs kill -9 2>/dev/null

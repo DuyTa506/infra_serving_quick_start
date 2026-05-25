@@ -9,6 +9,7 @@ CMD vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --host 0.0.0.0 \
     --port 8001 \
     --api-key "$API_KEY" \
+    --revision 95a723d08a9490559dae23d0cff1d9466213d989 \
     --tensor-parallel-size 2 \
     --max-model-len 131072 \
     --gpu-memory-utilization 0.75 \

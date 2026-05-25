@@ -14,6 +14,7 @@ mkdir -p /workspace/logs
 echo "[$(date)] Starting LLM server on :8011 → external :8001 (GPU 0+1, TP=2)" | tee -a "$LOG"
 exec vllm serve Qwen/Qwen3.6-35B-A3B \
     --api-key "$API_KEY" \
+    --revision 995ad96eacd98c81ed38be0c5b274b04031597b0 \
     --host 0.0.0.0 \
     --port 8011 \
     --tensor-parallel-size 2 \
