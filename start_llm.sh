@@ -19,11 +19,14 @@ exec vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --port 8011 \
     --tensor-parallel-size 2 \
     --max-model-len 131072 \
+    --max-num-batched-tokens 8192 \
     --gpu-memory-utilization 0.90 \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
-    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+    --safetensors-load-strategy prefetch \
+    --disable-custom-all-reduce \
     --language-model-only \
     --trust-remote-code \
     2>&1 | tee -a "$LOG"
