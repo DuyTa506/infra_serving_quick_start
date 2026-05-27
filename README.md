@@ -2,11 +2,13 @@
 
 3 services on 2x A100-SXM4 80GB (NVLink):
 
-| Port | Service | Model |
-|------|---------|-------|
-| 8001 | LLM | Qwen/Qwen3.6-35B-A3B-FP8 (TP=2, MTP, 64K ctx) |
-| 8000 | Embedding | BAAI/bge-large-en-v1.5 |
-| 8002 | Reranker | BAAI/bge-reranker-v2-m3 |
+| External | Internal | Service | Model |
+|----------|----------|---------|-------|
+| 8001 | 8011 | LLM | Qwen/Qwen3.6-35B-A3B-FP8 (TP=2, MTP, 64K ctx) |
+| 8000 | 8010 | Embedding | BAAI/bge-large-en-v1.5 |
+| 8002 | 8012 | Reranker | BAAI/bge-reranker-v2-m3 |
+
+vLLM binds to internal ports; nginx reverse-proxies the external ports to them.
 
 **Performance:** ~5,300 tok/s peak, 128 CCU stable, 16K-context TTFB <10s at 32 CCU.
 
@@ -273,6 +275,22 @@ tail -f logs/embedding.log
 tail -f logs/reranker.log
 ```
 
+### Nginx reverse proxy
+
+vLLM services bind to internal ports (8010, 8011, 8012). Nginx exposes them on
+public ports (8000, 8001, 8002) with the shared API key injected as an
+`Authorization` header — clients hit the public ports without needing the key.
+
+```bash
+# Generate and apply the nginx config (reads API_KEY from .env)
+bash apply_nginx.sh
+```
+
+`nginx.conf.template` contains just the three vLLM server blocks.
+`apply_nginx.sh` substitutes `${API_KEY}` via `envsubst`, inserts the blocks
+into `/etc/nginx/nginx.conf` (replacing any previous vLLM section), backs up
+the old config, runs `nginx -t`, and reloads.
+
 ---
 
 ## Benchmarking
@@ -319,12 +337,14 @@ Max batched tokens: 32,768. Max concurrent seqs: 128.
 ├── start_embedding.sh
 ├── start_reranker.sh
 ├── docker-compose.yml
-├── bench.py            ← basic throughput benchmark
-├── bench_ccu.py        ← CCU stress test
-├── bench_stress.py     ← full stress (128 CCU, 16K ctx, 32K output)
+├── nginx.conf.template  ← vLLM server blocks (${API_KEY} placeholder)
+├── apply_nginx.sh       ← render + apply nginx config
+├── bench.py             ← basic throughput benchmark
+├── bench_ccu.py         ← CCU stress test
+├── bench_stress.py      ← full stress (128 CCU, 16K ctx, 32K output)
 ├── llm/Dockerfile
 ├── embedding/Dockerfile
 ├── reranker/Dockerfile
-├── models/             ← HF model cache
-└── logs/               ← log files + PIDs
+├── models/              ← HF model cache
+└── logs/                ← log files + PIDs
 ```
