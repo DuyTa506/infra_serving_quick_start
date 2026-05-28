@@ -22,7 +22,7 @@ exec vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --tensor-parallel-size 2 \
     --max-model-len 65536 \
     --max-num-batched-tokens 32768 \
-    --gpu-memory-utilization 0.94 \
+    --gpu-memory-utilization 0.9 \
     --max-num-seqs 128 \
     --enable-prefix-caching \
     --reasoning-parser qwen3 \

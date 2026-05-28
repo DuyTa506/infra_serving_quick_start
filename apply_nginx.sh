@@ -1,13 +1,17 @@
 #!/bin/bash
 # Render nginx.conf.template with values from .env and apply to /etc/nginx/nginx.conf.
-# The template contains ONLY the vLLM server blocks — this script inserts them
-# into the existing nginx.conf (replacing any previous vLLM blocks).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source API_KEY from .env
+# ── prerequisites ──────────────────────────────────────────────────────────────
+if ! command -v envsubst &>/dev/null; then
+    echo "ERROR: envsubst not found. Install with: apt-get install -y gettext-base" >&2
+    exit 1
+fi
+
+# ── API key ────────────────────────────────────────────────────────────────────
 set -a; source "$SCRIPT_DIR/.env"; set +a
 
 if [ -z "$API_KEY" ]; then
@@ -19,37 +23,68 @@ TEMPLATE="$SCRIPT_DIR/nginx.conf.template"
 NGINX_CONF="/etc/nginx/nginx.conf"
 BACKUP="/etc/nginx/nginx.conf.bak.$(date +%Y%m%d_%H%M%S)"
 
-# Generate the vLLM server blocks from template
-VLLM_BLOCK=$(API_KEY="$API_KEY" envsubst '${API_KEY}' < "$TEMPLATE")
+# ── render template to temp file ───────────────────────────────────────────────
+VLLM_TMP=$(mktemp)
+API_KEY="$API_KEY" envsubst '${API_KEY}' < "$TEMPLATE" > "$VLLM_TMP"
 
-# Back up current config
+# ── backup ─────────────────────────────────────────────────────────────────────
 cp "$NGINX_CONF" "$BACKUP"
 echo "[OK] Backed up to $BACKUP"
 
-# Remove any existing vLLM blocks (between "# ── vLLM" and the next "^    }" at server-block level)
-# Then insert the new block before the "map" section (or at end of http block if no maps).
-sed -i '/^[[:space:]]*# ── vLLM/,/^[[:space:]]*# \(Dockerless\|map\)/{ /^[[:space:]]*# \(Dockerless\|map\)/!d; }' "$NGINX_CONF"
+# ── update config ──────────────────────────────────────────────────────────────
+VLLM_TMP="$VLLM_TMP" NGINX_CONF="$NGINX_CONF" python3 << 'PYEOF'
+import os, re
 
-# Insert before the first map directive or before the closing http brace
-if grep -q '^[[:space:]]*map ' "$NGINX_CONF"; then
-    # Insert before the map section
-    INSERT_LINE=$(grep -n '^[[:space:]]*map ' "$NGINX_CONF" | head -1 | cut -d: -f1)
-    head -n $((INSERT_LINE - 1)) "$NGINX_CONF" > "$NGINX_CONF.tmp"
-    echo "$VLLM_BLOCK" >> "$NGINX_CONF.tmp"
-    echo "" >> "$NGINX_CONF.tmp"
-    tail -n +$INSERT_LINE "$NGINX_CONF" >> "$NGINX_CONF.tmp"
-else
-    # Insert before the closing } of http block
-    sed -i '/^}/i\'$'\n'"$VLLM_BLOCK"$'\n' "$NGINX_CONF"
-fi
+nginx_conf = os.environ["NGINX_CONF"]
+with open(nginx_conf) as f:
+    conf = f.read()
 
-if [ -f "$NGINX_CONF.tmp" ]; then
-    mv "$NGINX_CONF.tmp" "$NGINX_CONF"
-fi
+with open(os.environ["VLLM_TMP"]) as f:
+    vllm_block = f.read()
+
+# 1. Remove stale vscode server block (conflicts on port 8001 with vLLM LLM)
+conf = re.sub(
+    r"^[ \t]*# vscode server\n[ \t]*server\s*\{[^}]*}\n",
+    "",
+    conf,
+    flags=re.MULTILINE,
+)
+
+# 2. Remove any previous vLLM blocks (handles both old and new format)
+#    New format has "# ─── /vLLM" end marker.
+#    Old format (no end marker) ends at blank line before "map" or closing "}".
+#    We match: header line, then all lines until either:
+#      a) the end-marker line (new format), or
+#      b) a lookahead for blank-line + map/} (old format)
+conf = re.sub(
+    r"^[ \t]*# ─── vLLM.*\n"
+    r"(?:.*\n)*?"
+    r"(?:"
+    r"^[ \t]*# ─── /vLLM.*\n"
+    r"|(?=\n[ \t]*(?:map |\}$))"
+    r")",
+    "",
+    conf,
+    flags=re.MULTILINE,
+)
+
+# 3. Insert vLLM blocks before the first "map" directive, or before closing http brace
+if "map " in conf:
+    idx = conf.index("map ")
+    conf = conf[:idx] + vllm_block + "\n" + conf[idx:]
+else:
+    conf = conf.rstrip("\n")
+    conf += "\n" + vllm_block + "\n}\n"
+
+with open(nginx_conf, "w") as f:
+    f.write(conf)
+PYEOF
+
+rm -f "$VLLM_TMP"
 
 echo "[OK] vLLM blocks written to $NGINX_CONF"
 
-# Test and reload
+# ── test and reload ────────────────────────────────────────────────────────────
 if nginx -t 2>&1; then
     nginx -s reload
     echo "[OK] Nginx reloaded"

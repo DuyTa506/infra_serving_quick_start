@@ -17,7 +17,7 @@ exec vllm serve BAAI/bge-reranker-v2-m3 \
     --host 0.0.0.0 \
     --port 8012 \
     --dtype float16 \
-    --max-model-len 512 \
+    --max-model-len 2048 \
     --gpu-memory-utilization 0.15 \
     --trust-remote-code \
     2>&1 | tee -a "$LOG"

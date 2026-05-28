@@ -1,6 +1,7 @@
 #!/bin/bash
 # BGE-Large embedding server — GPU 1, port 8000
-# vLLM auto-detects embedding model type; no --task flag needed.
+# Uses chunked processing (CLS pooling) to support long documents
+# without exceeding the model's native 512-token context window.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 set -a; source "$SCRIPT_DIR/.env"; set +a
 export HF_HOME="$SCRIPT_DIR/models"
@@ -17,6 +18,8 @@ exec vllm serve BAAI/bge-large-en-v1.5 \
     --port 8010 \
     --dtype float16 \
     --max-model-len 512 \
-    --gpu-memory-utilization 0.15 \
+    --gpu-memory-utilization 0.07 \
     --trust-remote-code \
+    --served-model-name bge-large-en-v1.5 \
+    --pooler-config '{"pooling_type":"CLS","use_activation":true,"enable_chunked_processing":true,"max_embed_len":2048}' \
     2>&1 | tee -a "$LOG"

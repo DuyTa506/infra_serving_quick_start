@@ -3,12 +3,6 @@
 #   embedding :8010  →  external :8000
 #   LLM        :8011  →  external :8001
 #   reranker   :8012  →  external :8002
-#
-# Usage:
-#   1. Set API_KEY in .env (or export it).
-#   2. Run:  bash apply_nginx.sh
-#      This substitutes ${API_KEY} and copies the result to /etc/nginx/nginx.conf.
-#   3. Test:  nginx -t   &&   nginx -s reload
 
     # ── vLLM Embedding  :8000 → :8010 ──────────────────────────────────────────
     server {
@@ -53,3 +47,4 @@
             proxy_send_timeout 10s;
         }
     }
+# ─── /vLLM ───────────────────────────────────────────────────────────────────
