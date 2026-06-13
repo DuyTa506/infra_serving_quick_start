@@ -1,121 +1,247 @@
-version: "3.8"
-
-# GPU layout (2x A100 80GB SXM — NVLink P2P enabled):
-#   GPU 0 — LLM shard 0 + reranker  (LLM@0.94 → ~75 GB, reranker@0.15 → 12 GB)
-#   GPU 1 — LLM shard 1 + embedding (LLM@0.94 → ~75 GB, embedding@0.15 → 12 GB)
+# ─────────────────────────────────────────────────────────────────────────────
+#  vLLM Serving Stack — 2x RTX 6000 Pro (Blackwell, 96 GB, PCIe / NO NVLink P2P)
+# ─────────────────────────────────────────────────────────────────────────────
 #
-# network_mode: host is required — dockerd runs without bridge networking (RunPod DinD).
-# Services bind directly to host ports: 8000 (embed), 8001 (llm), 8002 (rerank).
+#  Because the RTX 6000 Pro is PCIe-only (no NVLink P2P), tensor-parallel across
+#  the two cards would bottleneck on the PCIe bus. Instead each GPU runs a FULL
+#  independent stack and nginx load-balances across them:
+#
+#    GPU 0 ── llm-0 (NVFP4) ── embedding-0 ── reranker-0  ┐
+#                                                          ├─► nginx LB ─► clients
+#    GPU 1 ── llm-1 (NVFP4) ── embedding-1 ── reranker-1  ┘
+#
+#  Public (host) ports — served by nginx, round-robin / least-conn over both GPUs:
+#    8000  embedding   (POST /v1/embeddings)
+#    8001  llm         (POST /v1/chat/completions)   OpenAI-compatible
+#    8002  reranker    (POST /v1/rerank, /v1/score)
+#
+#  Observability (centralized):
+#    3000  Grafana     — dashboards: GPU (DCGM) + container logs (Loki)
+#    9090  Prometheus  — metric store
+#    9400  DCGM        — raw NVIDIA GPU metrics
+#    8090  cAdvisor    — per-container CPU/mem/net
+#
+#  Everything comes up with a single `docker compose up -d`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-vllm-common: &vllm-common
+  image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+  ipc: host
+  restart: unless-stopped
+  volumes:
+    - ./models:/root/.cache/huggingface
+  environment:
+    - HF_HOME=/root/.cache/huggingface
+    - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    - API_KEY=${API_KEY:-}
+  networks: [serving]
+
+# Reusable GPU reservation anchors (pin a service to ONE physical card)
+x-gpu0: &gpu0
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+x-gpu1: &gpu1
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["1"]
+            capabilities: [gpu]
 
 services:
 
-  # ── LLM ──────────────────────────────────────────────────────────────────────
-  llm:
-    build: ./llm
-    image: vllm-llm:latest
-    container_name: vllm-llm
-    network_mode: host
-    ipc: host
-    ulimits:
-      memlock: -1
-      stack: 67108864
-    volumes:
-      - ./models:/root/.cache/huggingface
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - API_KEY=${API_KEY:-}
-      - VLLM_WORKER_MULTIPROC_METHOD=spawn
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0", "1"]
-              capabilities: [gpu]
-    command: [
-      "--model", "Qwen/Qwen3.6-35B-A3B-FP8",
+  # ═══════════════════════════════ GPU 0 ═══════════════════════════════════════
+  llm-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: llm-0
+    command: &llm-cmd [
+      "--model", "${LLM_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}",
       "--host", "0.0.0.0",
       "--port", "8001",
       "--api-key", "${API_KEY:-}",
-      "--revision", "95a723d08a9490559dae23d0cff1d9466213d989",
-      "--tensor-parallel-size", "2",
-      "--max-model-len", "65536",
-      "--max-num-batched-tokens", "32768",
-      "--gpu-memory-utilization", "0.94",
+      "--quantization", "modelopt",
+      "--kv-cache-dtype", "fp8",
+      "--tensor-parallel-size", "1",
+      "--max-model-len", "${LLM_MAX_MODEL_LEN:-65536}",
+      "--max-num-batched-tokens", "16384",
+      "--gpu-memory-utilization", "0.80",
       "--max-num-seqs", "128",
       "--enable-prefix-caching",
       "--reasoning-parser", "qwen3",
       "--enable-auto-tool-choice",
       "--tool-call-parser", "qwen3_coder",
       "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}",
-      "--safetensors-load-strategy", "prefetch",
-      "--language-model-only",
       "--trust-remote-code"
     ]
-    restart: unless-stopped
 
-  # ── Embedding ─────────────────────────────────────────────────────────────────
-  embedding:
-    build: ./embedding
-    image: vllm-embedding:latest
-    container_name: vllm-embedding
-    network_mode: host
-    ipc: host
-    volumes:
-      - ./models:/root/.cache/huggingface
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - API_KEY=${API_KEY:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            # GPU 1 only — shares remaining ~6 GB after LLM shard
-            - driver: nvidia
-              device_ids: ["1"]
-              capabilities: [gpu]
-    command: [
-      "--model", "BAAI/bge-large-en-v1.5",
+  embedding-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: embedding-0
+    command: &embed-cmd [
+      "--model", "${EMBED_MODEL:-BAAI/bge-large-en-v1.5}",
       "--host", "0.0.0.0",
       "--port", "8000",
       "--api-key", "${API_KEY:-}",
-      "--revision", "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
       "--dtype", "float16",
       "--max-model-len", "512",
-      "--gpu-memory-utilization", "0.15",
+      "--gpu-memory-utilization", "0.05",
       "--trust-remote-code"
     ]
-    restart: unless-stopped
 
-  # ── Reranker ──────────────────────────────────────────────────────────────────
-  reranker:
-    build: ./reranker
-    image: vllm-reranker:latest
-    container_name: vllm-reranker
-    network_mode: host
-    ipc: host
+  reranker-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: reranker-0
+    command: &rerank-cmd [
+      "--model", "${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}",
+      "--host", "0.0.0.0",
+      "--port", "8002",
+      "--api-key", "${API_KEY:-}",
+      "--dtype", "float16",
+      "--max-model-len", "512",
+      "--gpu-memory-utilization", "0.06",
+      "--trust-remote-code"
+    ]
+
+  # ═══════════════════════════════ GPU 1 ═══════════════════════════════════════
+  llm-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: llm-1
+    command: *llm-cmd
+
+  embedding-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: embedding-1
+    command: *embed-cmd
+
+  reranker-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: reranker-1
+    command: *rerank-cmd
+
+  # ═══════════════════════════ nginx — load balancer ═══════════════════════════
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    depends_on: [llm-0, llm-1, embedding-0, embedding-1, reranker-0, reranker-1]
+    ports:
+      - "8000:8000"   # embedding   (LB over embedding-0, embedding-1)
+      - "8001:8001"   # llm         (LB over llm-0, llm-1)
+      - "8002:8002"   # reranker    (LB over reranker-0, reranker-1)
     volumes:
-      - ./models:/root/.cache/huggingface
+      # official nginx image runs envsubst on /etc/nginx/templates/*.template → conf.d/
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
     environment:
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - API_KEY=${API_KEY:-}
+      # only substitute ${API_KEY} in the template; leave nginx's own $vars alone
+      - NGINX_ENVSUBST_FILTER=API_KEY
+    networks: [serving]
+
+  # ═══════════════════════ Observability / central logging ═════════════════════
+
+  # Raw NVIDIA GPU metrics (utilization, VRAM, temp, power, ...) — both cards
+  dcgm-exporter:
+    image: nvidia/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    container_name: dcgm-exporter
+    restart: unless-stopped
+    cap_add: [SYS_ADMIN]
     deploy:
       resources:
         reservations:
           devices:
-            # GPU 0 only — shares remaining ~6 GB after LLM shard
             - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
-    command: [
-      "--model", "BAAI/bge-reranker-v2-m3",
-      "--host", "0.0.0.0",
-      "--port", "8002",
-      "--api-key", "${API_KEY:-}",
-      "--revision", "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
-      "--dtype", "float16",
-      "--max-model-len", "512",
-      "--gpu-memory-utilization", "0.15",
-      "--trust-remote-code"
-    ]
+              count: all
+              capabilities: [gpu, utility]
+    ports:
+      - "9400:9400"
+    networks: [serving]
+
+  # Per-container CPU / memory / network
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
     restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8090:8080"
+    networks: [serving]
+
+  # Metric store — scrapes dcgm-exporter + cadvisor
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+    networks: [serving]
+
+  # Log store
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks: [serving]
+
+  # Ships ALL container logs (llm/embed/rerank/nginx/...) into Loki
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+    networks: [serving]
+
+  # Single pane of glass: GPU dashboards + searchable logs
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_DEFAULT_THEME=light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus, loki]
+    networks: [serving]
+
+networks:
+  serving:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:

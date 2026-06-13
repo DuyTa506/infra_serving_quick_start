@@ -2,7 +2,7 @@ import asyncio, aiohttp, time, sys
 
 API = "http://localhost:8001/v1/chat/completions"
 KEY = "sk-secai2026"
-MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
+MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 
 PROMPT = "Explain the Transformer attention mechanism in detail, covering Q, K, V projections, scaled dot-product, multi-head attention, and how they interact."
 

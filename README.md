@@ -1,50 +1,102 @@
-# vLLM Serving Stack
+# vLLM Serving Stack — 2× RTX 6000 Pro (Blackwell)
 
-3 services on 2x A100-SXM4 80GB (NVLink):
+OpenAI-compatible LLM + embedding + reranker, fully Dockerized, with centralized
+GPU + log monitoring. **`docker compose up -d` brings up everything.**
 
-| External | Internal | Service | Model |
-|----------|----------|---------|-------|
-| 8001 | 8011 | LLM | Qwen/Qwen3.6-35B-A3B-FP8 (TP=2, MTP, 64K ctx) |
-| 8000 | 8010 | Embedding | BAAI/bge-large-en-v1.5 |
-| 8002 | 8012 | Reranker | BAAI/bge-reranker-v2-m3 |
+## Why this layout
 
-vLLM binds to internal ports; nginx reverse-proxies the external ports to them.
+The RTX 6000 Pro Blackwell (96 GB GDDR7) is **PCIe-only — no NVLink P2P**.
+Tensor-parallel across the two cards would bottleneck on the PCIe bus, so instead
+each GPU runs a **full independent replica** and nginx load-balances across them:
 
-**Performance:** ~5,300 tok/s peak, 128 CCU stable, 16K-context TTFB <10s at 32 CCU.
+```
+GPU 0 ── llm-0 (NVFP4) ── embedding-0 ── reranker-0  ┐
+                                                      ├─► nginx LB ─► clients
+GPU 1 ── llm-1 (NVFP4) ── embedding-1 ── reranker-1  ┘
+```
+
+No cross-GPU NCCL traffic happens at all (TP=1 per replica), so the missing P2P
+link is irrelevant — and you get ~2× LLM throughput plus HA: if one card's
+replica dies, nginx routes to the other.
+
+The LLM is **`nvidia/Qwen3.6-35B-A3B-NVFP4`** — NVFP4 is the native fast path on
+Blackwell (SM120). NVFP4 weights are ~20 GB, and `--kv-cache-dtype fp8` halves
+KV memory, so a single card has huge headroom for context + the two small models.
+
+| Public port | Service | Model | Endpoint |
+|------|---------|-------|----------|
+| 8001 | LLM | nvidia/Qwen3.6-35B-A3B-NVFP4 (NVFP4, FP8 KV) | `POST /v1/chat/completions` |
+| 8000 | Embedding | BAAI/bge-large-en-v1.5 | `POST /v1/embeddings` |
+| 8002 | Reranker | BAAI/bge-reranker-v2-m3 | `POST /v1/rerank` · `/v1/score` |
+
+| Observability port | Service |
+|------|---------|
+| 3000 | **Grafana** — GPU dashboards + searchable logs of all containers |
+| 9090 | Prometheus — metric store |
+| 9400 | DCGM exporter — raw NVIDIA GPU metrics |
+| 8090 | cAdvisor — per-container CPU/mem/net |
 
 ---
 
-## API Usage
+## Quick start
 
 ```bash
-# Configure these
-API_KEY="sk-..."                          # from .env
-LLM_URL="https://<pod>-8001.proxy.runpod.net"
-EMB_URL="https://<pod>-8000.proxy.runpod.net"
-RERANK_URL="https://<pod>-8002.proxy.runpod.net"
+# 1. Host prep (Docker + NVIDIA Container Toolkit). Run once, as root.
+bash setup.sh
+
+# 2. Configure
+cp .env.example .env
+nano .env            # set API_KEY and HF_TOKEN
+
+# 3. Launch the whole stack (6 vLLM replicas + nginx + monitoring)
+docker compose up -d
+
+# 4. Watch it come up
+bash status.sh
+docker compose logs -f llm-0      # first boot downloads the model (~20 GB)
 ```
 
-**Auth:** All `/v1/*` endpoints require `Authorization: Bearer $API_KEY`.
-
-Swagger docs:
-- LLM: `$LLM_URL/docs`
-- Embedding: `$EMB_URL/docs`
-- Reranker: `$RERANK_URL/docs`
+First boot pulls the NVFP4 weights into `./models/` (persisted, so restarts are
+fast). Services report `:8001 (llm) OK` in `status.sh` once ready.
 
 ---
 
-### LLM — Chat Completions
+## Centralized monitoring (single pane of glass)
 
+Open **http://localhost:3000** (Grafana, default `admin` / `admin` — change in
+`.env`). The pre-provisioned **"vLLM Serving — GPU & Logs"** dashboard shows:
+
+- **GPU panels** (NVIDIA DCGM): utilization, VRAM used, temperature, power, clocks — per card.
+- **Logs panel** (Loki): live, searchable logs of every container. Use the
+  **Container** dropdown to filter to `llm-0`, `embedding-1`, `nginx`, etc.
+
+How the logs get there: **Promtail** tails every container via the Docker socket
+and ships them to **Loki**; **Prometheus** scrapes **DCGM** (GPUs) and **cAdvisor**
+(containers). Nothing to wire up — it's all in `docker compose up`.
+
+Prefer the terminal? `docker compose logs -f` (all) or `docker compose logs -f llm-0`.
+
+---
+
+## API usage
+
+**Auth:** nginx injects the shared key, so clients hit the public ports **without**
+a token. (Keep the ports behind a firewall, or add your own auth — see Security.)
+
+```bash
+API_KEY="sk-..."                  # only needed if you add client-side auth
+LLM_URL="http://<host>:8001"
+EMB_URL="http://<host>:8000"
+RERANK_URL="http://<host>:8002"
 ```
-POST /v1/chat/completions
-```
+
+### LLM — Chat Completions
 
 ```bash
 curl "$LLM_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
   -d '{
-    "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello, how are you?"}
@@ -54,31 +106,20 @@ curl "$LLM_URL/v1/chat/completions" \
   }'
 ```
 
-**Python (OpenAI SDK):**
-
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-    base_url=f"{LLM_URL}/v1",
-    api_key=API_KEY,
-)
+client = OpenAI(base_url=f"{LLM_URL}/v1", api_key=API_KEY)
 
 completion = client.chat.completions.create(
-    model="Qwen/Qwen3.6-35B-A3B-FP8",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Hello!"},
-    ],
+    model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+    messages=[{"role": "user", "content": "Hello!"}],
 )
 print(completion.choices[0].message.content)
-```
 
-**Streaming:**
-
-```python
+# Streaming
 stream = client.chat.completions.create(
-    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    model="nvidia/Qwen3.6-35B-A3B-NVFP4",
     messages=[{"role": "user", "content": "Tell me a short story."}],
     stream=True,
 )
@@ -87,264 +128,103 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-**Python (requests):**
-
-```python
-import requests
-
-r = requests.post(
-    f"{LLM_URL}/v1/chat/completions",
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    json={
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
-        "messages": [
-            {"role": "user", "content": "Hello!"},
-        ],
-    },
-)
-print(r.json()["choices"][0]["message"]["content"])
-```
-
-**JavaScript:**
-
-```js
-const r = await fetch(`${LLM_URL}/v1/chat/completions`, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${API_KEY}`,
-  },
-  body: JSON.stringify({
-    model: "Qwen/Qwen3.6-35B-A3B-FP8",
-    messages: [{ role: "user", content: "Hello!" }],
-  }),
-});
-const data = await r.json();
-console.log(data.choices[0].message.content);
-```
-
----
-
 ### Embedding
-
-```
-POST /v1/embeddings
-```
 
 ```bash
 curl "$EMB_URL/v1/embeddings" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
-  -d '{"model": "BAAI/bge-large-en-v1.5", "input": "Hello world"}'
-
-# batch
-curl "$EMB_URL/v1/embeddings" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
-  -d '{"model": "BAAI/bge-large-en-v1.5", "input": ["text 1", "text 2", "text 3"]}'
+  -d '{"model": "BAAI/bge-large-en-v1.5", "input": ["text 1", "text 2"]}'
 ```
 
-**Python (OpenAI SDK):**
-
 ```python
-from openai import OpenAI
-
 client = OpenAI(base_url=f"{EMB_URL}/v1", api_key=API_KEY)
-
-r = client.embeddings.create(
-    model="BAAI/bge-large-en-v1.5",
-    input="Hello world",
-)
-print(f"Dim: {len(r.data[0].embedding)}")  # 1024
+r = client.embeddings.create(model="BAAI/bge-large-en-v1.5", input="Hello world")
+print(len(r.data[0].embedding))   # 1024
 ```
-
-**Python (requests):**
-
-```python
-import requests
-
-r = requests.post(
-    f"{EMB_URL}/v1/embeddings",
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    json={"model": "BAAI/bge-large-en-v1.5", "input": "Hello world"},
-)
-embedding = r.json()["data"][0]["embedding"]
-```
-
----
 
 ### Reranker
 
-```
-POST /v1/score       (pairwise)
-POST /v1/rerank      (Cohere format — list rerank)
-```
-
-#### /v1/score — Pairwise
-
 ```bash
-curl "$RERANK_URL/v1/score" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
-  -d '{
-    "model": "BAAI/bge-reranker-v2-m3",
-    "text_1": "What is AI?",
-    "text_2": "AI is artificial intelligence."
-  }'
-```
-
-```python
-import requests
-
-r = requests.post(
-    f"{RERANK_URL}/v1/score",
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    json={
-        "model": "BAAI/bge-reranker-v2-m3",
-        "text_1": "What is AI?",
-        "text_2": "AI is artificial intelligence.",
-    },
-)
-print(r.json()["data"][0]["score"])  # e.g. 0.9989
-```
-
-#### /v1/rerank — List
-
-```bash
+# Cohere-style list rerank
 curl "$RERANK_URL/v1/rerank" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
   -d '{
     "model": "BAAI/bge-reranker-v2-m3",
     "query": "capital of France",
-    "documents": [
-      "Paris is the capital of France.",
-      "Berlin is the capital of Germany.",
-      "France is a country in Europe."
-    ],
+    "documents": ["Paris is the capital of France.", "Berlin is the capital of Germany."],
     "top_n": 2
   }'
-```
 
-```python
-import requests
-
-r = requests.post(
-    f"{RERANK_URL}/v1/rerank",
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    json={
-        "model": "BAAI/bge-reranker-v2-m3",
-        "query": "capital of France",
-        "documents": [
-            "Paris is the capital of France.",
-            "Berlin is the capital of Germany.",
-            "France is a country in Europe.",
-        ],
-        "top_n": 2,
-    },
-)
-for item in r.json()["results"]:
-    print(f"  [{item['index']}] {item['relevance_score']:.4f}  {item['document']['text']}")
+# Pairwise score
+curl "$RERANK_URL/v1/score" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "BAAI/bge-reranker-v2-m3", "text_1": "What is AI?", "text_2": "AI is artificial intelligence."}'
 ```
 
 ---
 
-## Server Operations
-
-### First time setup
+## Operations
 
 ```bash
-bash setup.sh
-cp .env.example .env
-# edit .env — set API_KEY and HF_TOKEN
+docker compose up -d            # start everything
+docker compose ps               # what's running
+docker compose logs -f llm-0    # follow one replica
+docker compose restart llm-1    # restart a single replica
+docker compose down             # stop everything (keeps models + volumes)
+docker compose pull             # update images, then `up -d` again
+bash status.sh                  # health + GPU + endpoint check
 ```
 
-### Start / Stop / Status
+### Scale / tune
 
-```bash
-bash start_all.sh
-bash status.sh
-bash stop_all.sh
-```
-
-### Logs
-
-```bash
-tail -f logs/llm.log
-tail -f logs/embedding.log
-tail -f logs/reranker.log
-```
-
-### Nginx reverse proxy
-
-vLLM services bind to internal ports (8010, 8011, 8012). Nginx exposes them on
-public ports (8000, 8001, 8002) with the shared API key injected as an
-`Authorization` header — clients hit the public ports without needing the key.
-
-```bash
-# Generate and apply the nginx config (reads API_KEY from .env)
-bash apply_nginx.sh
-```
-
-`nginx.conf.template` contains just the three vLLM server blocks.
-`apply_nginx.sh` substitutes `${API_KEY}` via `envsubst`, inserts the blocks
-into `/etc/nginx/nginx.conf` (replacing any previous vLLM section), backs up
-the old config, runs `nginx -t`, and reloads.
+- **Context length:** raise `LLM_MAX_MODEL_LEN` in `.env` (NVFP4 + FP8 KV leaves
+  room toward the model's full 262 144 window).
+- **VRAM split per card:** in `docker-compose.yml`, `--gpu-memory-utilization`
+  is `0.80` (LLM) / `0.05` (embed) / `0.06` (rerank) → ~87 GB of 96 GB used.
+- **Optional Blackwell tuning:** the model card also suggests
+  `--moe-backend marlin` and `--attention-backend flashinfer`; add them to the
+  `llm-cmd` block if your vLLM build supports them.
 
 ---
 
-## Benchmarking
+## GPU memory layout (per 96 GB card)
 
-Three benchmark scripts included:
-
-```bash
-# Basic throughput (C=1,2,4,8)
-python3 bench.py
-
-# CCU stress test (C=1..64)
-python3 bench_ccu.py
-
-# Full stress: 128 CCU + long prompts + 32k output
-python3 bench_stress.py
 ```
-
-All scripts hit `localhost:8001` with the API key from `.env`. Edit `API` and `KEY` at the top of each script to change target.
+LLM  (NVFP4 ~20 GB weights + FP8 KV cache)   util 0.80  ≈ 77 GB
+Embedding (bge-large, fp16)                  util 0.05  ≈  5 GB
+Reranker  (bge-reranker-v2-m3, fp16)         util 0.06  ≈  6 GB
+                                              ─────────────────
+                                              ≈ 88 GB / 96 GB
+```
 
 ---
 
-## GPU Layout
+## Security note
 
-```
-GPU 0  →  LLM shard 0  (94% ≈ 75 GB)  +  Reranker (15% ≈ 12 GB)
-GPU 1  →  LLM shard 1  (94% ≈ 75 GB)  +  Embedding (15% ≈ 12 GB)
-```
-
-LLM: TP=2, 64K context, MTP speculative decoding, NVLink P2P, prefix caching.
-Max batched tokens: 32,768. Max concurrent seqs: 128.
+nginx **injects** the API key, so anything that can reach ports 8000/8001/8002
+gets free access. That's convenient behind a firewall/VPN but unsafe on a public
+IP. To require client auth instead, edit `nginx/default.conf.template`: remove the
+`proxy_set_header Authorization ...` lines so the client's own
+`Authorization: Bearer` header is passed through to vLLM (which validates it).
 
 ---
 
 ## Files
 
 ```
-├── .env                ← API key + HF token
-├── .env.example        ← config template
-├── setup.sh            ← one-shot setup
-├── start_all.sh        ← start all services
-├── stop_all.sh         ← stop all services
-├── status.sh           ← health + GPU check
-├── start_llm.sh
-├── start_embedding.sh
-├── start_reranker.sh
-├── docker-compose.yml
-├── nginx.conf.template  ← vLLM server blocks (${API_KEY} placeholder)
-├── apply_nginx.sh       ← render + apply nginx config
-├── bench.py             ← basic throughput benchmark
-├── bench_ccu.py         ← CCU stress test
-├── bench_stress.py      ← full stress (128 CCU, 16K ctx, 32K output)
-├── llm/Dockerfile
-├── embedding/Dockerfile
-├── reranker/Dockerfile
-├── models/              ← HF model cache
-└── logs/                ← log files + PIDs
+├── docker-compose.yml              ← the whole stack (serving + monitoring)
+├── .env.example                    ← config template
+├── setup.sh                        ← host prep: Docker + NVIDIA toolkit
+├── status.sh                       ← health / GPU / endpoint check
+├── nginx/
+│   └── default.conf.template       ← load-balancer + auth (envsubst'd at boot)
+├── monitoring/
+│   ├── prometheus/prometheus.yml   ← scrape DCGM + cAdvisor
+│   ├── loki/loki-config.yml        ← log store
+│   ├── promtail/promtail-config.yml← ship container logs → Loki
+│   └── grafana/
+│       ├── provisioning/           ← datasources + dashboard providers
+│       └── dashboards/vllm-stack.json  ← GPU + logs dashboard
+├── bench.py / bench_ccu.py / bench_stress.py   ← throughput benchmarks
+└── models/                         ← HF model cache (persisted)
 ```

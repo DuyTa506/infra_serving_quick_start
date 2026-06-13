@@ -1,31 +1,28 @@
 #!/bin/bash
-# One-shot setup script for a fresh RunPod pod (Ubuntu 22.04/24.04, CUDA pre-installed).
-# Run as root. After this completes, use start_all.sh to launch services.
+# One-shot host prep for the vLLM serving stack on a standard Docker host
+# (bare-metal or cloud VM) with 2x RTX 6000 Pro Blackwell.
 #
-# What this does:
-#   1. Install Docker (with nvidia runtime configured)
-#   2. Install NVIDIA Container Toolkit
-#   3. Install vLLM (latest) for native serving
-#   4. Create models/ for persistent model cache
-#   5. Make all scripts executable
-
+# Installs: Docker Engine + Compose plugin, NVIDIA Container Toolkit, and wires
+# the nvidia runtime into dockerd. After this, just `docker compose up -d`.
+#
+# Run as root on Ubuntu 22.04 / 24.04 with the NVIDIA driver already installed.
 set -e
 
 echo "=========================================="
-echo " vLLM Stack Setup"
+echo " vLLM Stack — host setup (Docker + NVIDIA)"
 echo "=========================================="
 
-# ── 1. Docker ──────────────────────────────────────────────────────────────────
+# ── 1. Docker Engine + Compose plugin ─────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
-    echo "[1/5] Installing Docker..."
+    echo "[1/4] Installing Docker..."
     curl -fsSL https://get.docker.com | sh
 else
-    echo "[1/5] Docker already installed ($(docker --version 2>/dev/null || echo 'daemon not running'))"
+    echo "[1/4] Docker present ($(docker --version))"
 fi
 
 # ── 2. NVIDIA Container Toolkit ───────────────────────────────────────────────
 if ! command -v nvidia-ctk &>/dev/null; then
-    echo "[2/5] Installing NVIDIA Container Toolkit..."
+    echo "[2/4] Installing NVIDIA Container Toolkit..."
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
         | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
     curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
@@ -34,79 +31,44 @@ if ! command -v nvidia-ctk &>/dev/null; then
     apt-get update -qq
     apt-get install -y nvidia-container-toolkit
 else
-    echo "[2/5] NVIDIA Container Toolkit already installed"
+    echo "[2/4] NVIDIA Container Toolkit present"
 fi
 
-# ── 3. Configure Docker daemon (nvidia runtime + no iptables for RunPod DinD) ─
-echo "[3/5] Configuring Docker daemon..."
-cat > /etc/docker/daemon.json << 'EOF'
-{
-    "iptables": false,
-    "bridge": "none",
-    "runtimes": {
-        "nvidia": {
-            "args": [],
-            "path": "nvidia-container-runtime"
-        }
-    },
-    "default-runtime": "nvidia"
-}
-EOF
+# ── 3. Wire nvidia runtime into dockerd ───────────────────────────────────────
+echo "[3/4] Configuring nvidia runtime for Docker..."
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
 
-# Start dockerd if not running
-if ! docker info &>/dev/null 2>&1; then
-    echo "     Starting dockerd..."
-    nohup dockerd 2>/tmp/dockerd.log &
-    sleep 5
-fi
-
-# Persist dockerd start across reboots (no systemd on RunPod)
-if [ ! -f /etc/rc.local ]; then
-    echo '#!/bin/bash' > /etc/rc.local
-    chmod +x /etc/rc.local
-fi
-grep -q "dockerd" /etc/rc.local || echo "nohup dockerd 2>/tmp/dockerd.log &" >> /etc/rc.local
-
-# ── 4. Install vLLM ───────────────────────────────────────────────────────────
-if python3 -c "import vllm" &>/dev/null 2>&1; then
-    echo "[4/5] vLLM already installed ($(python3 -c 'import vllm; print(vllm.__version__)'))"
-else
-    echo "[4/5] Installing vLLM (cu129 wheel — compatible with CUDA 12.8+)..."
-    VLLM_VER=$(curl -s https://api.github.com/repos/vllm-project/vllm/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))")
-    ARCH=$(uname -m)
-    pip install \
-        "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VER}/vllm-${VLLM_VER}+cu129-cp38-abi3-manylinux_2_34_${ARCH}.whl" \
-        --extra-index-url https://download.pytorch.org/whl/cu129
-fi
-
-# ── 5. Workspace setup ────────────────────────────────────────────────────────
+# ── 4. Workspace ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-echo "[5/5] Setting up project directories..."
-mkdir -p "$SCRIPT_DIR/models" "$SCRIPT_DIR/logs/pids"
-
-# Make all scripts executable
-chmod +x "$SCRIPT_DIR"/*.sh
+echo "[4/4] Preparing workspace..."
+mkdir -p "$SCRIPT_DIR/models"
+chmod +x "$SCRIPT_DIR"/*.sh 2>/dev/null || true
 
 echo ""
-echo "=========================================="
-echo " Setup complete!"
-echo ""
-echo " GPU summary:"
-nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits \
-    | awk -F', ' '{printf "   GPU %s: %s (%s MiB)\n",$1,$2,$3}'
-echo ""
-echo " Next steps:"
-echo "   1. Create .env from template and set your API key + HF token:"
-echo "      cp .env.example .env"
-echo "      nano .env   # set API_KEY and HF_TOKEN"
-echo "   2. Start all services:"
-echo "      bash start_all.sh"
-echo "   3. Check status:"
-echo "      bash status.sh"
-echo ""
-echo " Ports:"
-echo "   8000 → BGE-Large embedding  (POST /v1/embeddings)"
-echo "   8001 → Qwen3 LLM            (POST /v1/chat/completions)"
-echo "   8002 → BGE-Reranker         (POST /v1/score  or  POST /v1/rerank)"
-echo "=========================================="
+echo " Verifying GPU visibility inside a container..."
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi \
+    --query-gpu=index,name,memory.total --format=csv,noheader,nounits \
+    | awk -F', ' '{printf "   GPU %s: %s (%s MiB)\n",$1,$2,$3}' \
+    || echo "   (could not run GPU container — check driver + toolkit)"
+
+cat <<'EOF'
+
+==========================================
+ Setup complete.
+
+ Next:
+   cp .env.example .env      # set API_KEY + HF_TOKEN
+   docker compose up -d      # build/pull + start everything
+   bash status.sh            # health + GPU + container check
+
+ Public endpoints (nginx load-balanced over both GPUs):
+   8000  embedding   POST /v1/embeddings
+   8001  llm         POST /v1/chat/completions   (OpenAI-compatible)
+   8002  reranker    POST /v1/rerank  |  /v1/score
+
+ Observability:
+   3000  Grafana     (admin / $GRAFANA_PASSWORD)  GPU dashboards + logs
+   9090  Prometheus
+==========================================
+EOF

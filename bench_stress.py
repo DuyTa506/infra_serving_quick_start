@@ -2,7 +2,7 @@ import asyncio, aiohttp, time
 
 API = "http://localhost:8001/v1/chat/completions"
 KEY = "sk-secai2026"
-MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
+MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 
 LONG_PROMPT = """You are a technical expert. Please provide a comprehensive analysis of distributed systems, covering:
 1. Consistency models (strong, eventual, causal) and their tradeoffs
