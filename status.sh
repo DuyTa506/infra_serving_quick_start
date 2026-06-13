@@ -17,12 +17,10 @@ for name in embedding llm reranker; do
 done
 
 echo ""
-echo "=== Observability ==="
-for svc in "grafana:3000" "prometheus:9090" "dcgm-exporter:9400/metrics"; do
-    name=${svc%%:*}; path=${svc#*:}
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:$path" 2>/dev/null)
-    echo "  $name  ($code)"
-done
+echo "=== Observability (single UI) ==="
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:3000/api/health" 2>/dev/null)
+echo "  Grafana  http://localhost:3000  ($code)"
+echo "  (Prometheus / DCGM / cAdvisor / Loki are internal — viewed inside Grafana)"
 
 echo ""
 echo "=== GPU usage ==="

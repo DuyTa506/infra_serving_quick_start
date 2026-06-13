@@ -67,8 +67,8 @@ cat <<'EOF'
    8001  llm         POST /v1/chat/completions   (OpenAI-compatible)
    8002  reranker    POST /v1/rerank  |  /v1/score
 
- Observability:
-   3000  Grafana     (admin / $GRAFANA_PASSWORD)  GPU dashboards + logs
-   9090  Prometheus
+ Observability (one UI):
+   3000  Grafana     (admin / $GRAFANA_PASSWORD)  GPU dashboards + all logs
+         Prometheus / DCGM / cAdvisor / Loki run internally behind Grafana.
 ==========================================
 EOF

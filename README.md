@@ -29,12 +29,15 @@ KV memory, so a single card has huge headroom for context + the two small models
 | 8000 | Embedding | BAAI/bge-large-en-v1.5 | `POST /v1/embeddings` |
 | 8002 | Reranker | BAAI/bge-reranker-v2-m3 | `POST /v1/rerank` · `/v1/score` |
 
+**Observability is unified behind one port** — open **`:3000` (Grafana)** and
+that's it. Prometheus, the DCGM GPU exporter, cAdvisor, and Loki run as
+**internal-only** services on the Docker network; Grafana queries them by name,
+so you never visit their ports.
+
 | Observability port | Service |
 |------|---------|
-| 3000 | **Grafana** — GPU dashboards + searchable logs of all containers |
-| 9090 | Prometheus — metric store |
-| 9400 | DCGM exporter — raw NVIDIA GPU metrics |
-| 8090 | cAdvisor — per-container CPU/mem/net |
+| 3000 | **Grafana** — the single pane: GPU dashboards + searchable logs of all containers |
+| _internal_ | Prometheus (metrics) · DCGM (GPU) · cAdvisor (containers) · Loki (logs) |
 
 ---
 

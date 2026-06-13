@@ -38,12 +38,17 @@ Model ids and key knobs are env vars in `.env` (`LLM_MODEL`, `EMBED_MODEL`,
 
 ## Ports
 
-| Port | What | Port | What |
-|------|------|------|------|
-| 8001 | LLM (LB) `POST /v1/chat/completions` | 3000 | Grafana (GPU + logs) |
-| 8000 | Embedding (LB) `POST /v1/embeddings` | 9090 | Prometheus |
-| 8002 | Reranker (LB) `/v1/rerank` `/v1/score` | 9400 | DCGM exporter |
-|      |                                       | 8090 | cAdvisor |
+| Published port | What |
+|------|------|
+| 8001 | LLM (LB) `POST /v1/chat/completions` |
+| 8000 | Embedding (LB) `POST /v1/embeddings` |
+| 8002 | Reranker (LB) `/v1/rerank` `/v1/score` |
+| 3000 | **Grafana — the ONLY monitoring UI** (GPU dashboards + logs) |
+
+**Monitoring is unified to one UI.** Prometheus, dcgm-exporter, cAdvisor, and
+Loki are internal-only (`expose:`, not `ports:`) — Grafana queries them by name
+over the `serving` network. Don't re-add their `ports:` mappings unless someone
+explicitly wants the raw Prometheus/DCGM UI for debugging.
 
 Internal container ports: llm `8001`, embedding `8000`, reranker `8002` (each
 container has its own netns on the `serving` bridge, so ports can repeat).
