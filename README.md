@@ -26,8 +26,8 @@ KV memory, so a single card has huge headroom for context + the two small models
 | Public port | Service | Model | Endpoint |
 |------|---------|-------|----------|
 | 8001 | LLM | nvidia/Qwen3.6-35B-A3B-NVFP4 (NVFP4, FP8 KV) | `POST /v1/chat/completions` |
-| 8000 | Embedding | BAAI/bge-large-en-v1.5 | `POST /v1/embeddings` |
-| 8002 | Reranker | BAAI/bge-reranker-v2-m3 | `POST /v1/rerank` · `/v1/score` |
+| 8000 | Embedding | BAAI/bge-m3 (multilingual, 1024-d) | `POST /v1/embeddings` |
+| 8002 | Reranker | Qwen/Qwen3-Reranker-0.6B | `POST /v1/rerank` · `/v1/score` |
 
 **Observability is unified behind one port** — open **`:3000` (Grafana)** and
 that's it. Prometheus, the DCGM GPU exporter, cAdvisor, and Loki run as
@@ -136,12 +136,12 @@ for chunk in stream:
 ```bash
 curl "$EMB_URL/v1/embeddings" \
   -H "Content-Type: application/json" \
-  -d '{"model": "BAAI/bge-large-en-v1.5", "input": ["text 1", "text 2"]}'
+  -d '{"model": "BAAI/bge-m3", "input": ["text 1", "text 2"]}'
 ```
 
 ```python
 client = OpenAI(base_url=f"{EMB_URL}/v1", api_key=API_KEY)
-r = client.embeddings.create(model="BAAI/bge-large-en-v1.5", input="Hello world")
+r = client.embeddings.create(model="BAAI/bge-m3", input="Hello world")
 print(len(r.data[0].embedding))   # 1024
 ```
 
@@ -152,7 +152,7 @@ print(len(r.data[0].embedding))   # 1024
 curl "$RERANK_URL/v1/rerank" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "BAAI/bge-reranker-v2-m3",
+    "model": "Qwen/Qwen3-Reranker-0.6B",
     "query": "capital of France",
     "documents": ["Paris is the capital of France.", "Berlin is the capital of Germany."],
     "top_n": 2
@@ -161,7 +161,7 @@ curl "$RERANK_URL/v1/rerank" \
 # Pairwise score
 curl "$RERANK_URL/v1/score" \
   -H "Content-Type: application/json" \
-  -d '{"model": "BAAI/bge-reranker-v2-m3", "text_1": "What is AI?", "text_2": "AI is artificial intelligence."}'
+  -d '{"model": "Qwen/Qwen3-Reranker-0.6B", "text_1": "What is AI?", "text_2": "AI is artificial intelligence."}'
 ```
 
 ---
@@ -194,8 +194,8 @@ bash status.sh                  # health + GPU + endpoint check
 
 ```
 LLM  (NVFP4 ~20 GB weights + FP8 KV cache)   util 0.80  ≈ 77 GB
-Embedding (bge-large, fp16)                  util 0.05  ≈  5 GB
-Reranker  (bge-reranker-v2-m3, fp16)         util 0.06  ≈  6 GB
+Embedding (bge-m3, fp16)                      util 0.05  ≈  5 GB
+Reranker  (Qwen3-Reranker-0.6B, fp16)         util 0.06  ≈  6 GB
                                               ─────────────────
                                               ≈ 88 GB / 96 GB
 ```
