@@ -30,11 +30,21 @@ GPU 1 ── llm-1 ── embedding-1 ── reranker-1  ┘
 - **LLM:** `nvidia/Qwen3.6-35B-A3B-NVFP4` — NVFP4 is the native fast path on
   Blackwell (SM120). Served with `--quantization modelopt` + `--kv-cache-dtype fp8`.
   NVFP4 weights ~20 GB; FP8 KV halves KV memory.
-- **Embedding:** `BAAI/bge-large-en-v1.5` (fp16, dim 1024)
-- **Reranker:** `BAAI/bge-reranker-v2-m3` (fp16) — `/v1/rerank` + `/v1/score`
+- **Embedding:** `BAAI/bge-m3` (MIT, multilingual, fp16, dim 1024) — served as a
+  pooling model (`--runner pooling`); default dense pooling → 1024-d vectors.
+- **Reranker:** `Qwen/Qwen3-Reranker-0.6B` (Apache-2.0) — `/v1/rerank` + `/v1/score`.
+  This is a **causal-LM reranker, not a cross-encoder**, so the `&rerank-cmd` block
+  must serve it with `--runner pooling` + `--hf-overrides`
+  (`architectures:[Qwen3ForSequenceClassification]`, `classifier_from_token:["no","yes"]`,
+  `is_original_qwen3_reranker:true`) + `--chat-template /templates/qwen3_reranker.jinja`.
+  **Changing `RERANK_MODEL` alone is NOT enough** for a Qwen3-Reranker — a plain
+  cross-encoder id (e.g. bge-reranker) needs no extra flags, but without these the
+  model loads as a generative LM and `/score` won't work. The jinja template is
+  bind-mounted via `./templates:/templates:ro` (added to the `*vllm-common` volumes).
 
 Model ids and key knobs are env vars in `.env` (`LLM_MODEL`, `EMBED_MODEL`,
-`RERANK_MODEL`, `LLM_MAX_MODEL_LEN`, `VLLM_IMAGE`).
+`RERANK_MODEL`, `LLM_MAX_MODEL_LEN`, `VLLM_IMAGE`). The reranker serve-args above
+are NOT env-driven — they live in the `&rerank-cmd` anchor in `docker-compose.yml`.
 
 ## Ports
 
