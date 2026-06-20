@@ -15,7 +15,8 @@ tuỳ theo tài nguyên sẵn có — cùng port, cùng API, client không cần
 ## Chọn môi trường
 
 ```
-Có 2× RTX 6000 Pro (96 GB, Blackwell)?  →  Môi trường 1: GPU (production)
+Có 2× RTX 6000 Pro (96 GB, Blackwell)?  →  Môi trường 1: GPU (production, nginx LB + monitoring)
+Chỉ có 1× RTX 6000 Pro, muốn bench?      →  Môi trường 1b: Single GPU (gọn, không nginx/monitoring)
 Chỉ có Colab / cloud GPU đơn?           →  Môi trường 2: Colab
 Máy thường, không GPU?                  →  Môi trường 3: No-GPU + DeepSeek API
 ```
@@ -80,6 +81,66 @@ docker-compose.yml          ← toàn bộ stack (YAML anchor: *vllm-common, *gp
 setup.sh / status.sh
 nginx/default.conf.template ← LB + auth (envsubst khi boot)
 monitoring/                 ← Prometheus · DCGM · cAdvisor · Loki · Grafana
+```
+
+---
+
+## Môi trường 1b — Single GPU (1× RTX 6000 Pro, để bench)
+
+Bản rút gọn của môi trường 1 cho **1 card duy nhất**: cả 3 model chạy trên GPU 0,
+**không nginx, không monitoring**. Port vLLM publish thẳng ra host nên client/bench
+gọi trực tiếp — vLLM tự validate `--api-key`. Dùng để đo throughput/latency thuần
+trước khi lên cấu hình 2-GPU production.
+
+```
+GPU 0 ── llm (NVFP4)  :8001
+      ── embedding    :8000
+      ── reranker     :8002   ──► clients / bench*.py
+```
+
+**VRAM (96 GB):** `LLM 0.80 (~77) + embed 0.05 (~5) + rerank 0.06 (~6) ≈ 88 / 96 GB`.
+
+> **Card phải là RTX 6000 Pro Blackwell (SM120).** `--quantization modelopt` (NVFP4)
+> chỉ chạy native trên Blackwell. Trên **RTX 6000 Ada (48 GB)**: NVFP4 không support
+> và 0.80×48 GB không đủ cho model 35B → đổi `LLM_MODEL` sang build int4/fp8 + hạ util.
+
+**Khởi động:**
+```bash
+# 1. Host prep (chạy 1 lần, root) — giống môi trường 1
+bash setup.sh
+
+# 2. Cấu hình — dùng CHUNG .env với môi trường 1
+cp .env.example .env
+nano .env          # set API_KEY, HF_TOKEN
+
+# 3. Lên 3 service trên GPU 0 (không nginx/monitoring)
+docker compose -f docker-compose.single.yml up -d
+
+# 4. Theo dõi tải model (lần đầu ~20 GB) + kiểm tra
+docker compose -f docker-compose.single.yml ps
+docker compose -f docker-compose.single.yml logs -f llm
+nvidia-smi
+```
+
+**Bench (sau khi 3 service `Ready`):**
+```bash
+pip install aiohttp openai
+python bench.py            # throughput LLM @ C=1,2,4,8 → tok/s, ttfb
+python bench_stress.py     # tải nặng hơn
+# bench_ccu.py: dành cho test CCU (chưa cần ở bước này)
+```
+
+**Thao tác thường dùng:**
+```bash
+docker compose -f docker-compose.single.yml restart llm
+docker compose -f docker-compose.single.yml down
+```
+
+**Files:**
+```
+docker-compose.single.yml   ← 3 service trên GPU 0, port publish thẳng (không nginx)
+.env.example                ← dùng chung với môi trường 1
+bench.py / bench_stress.py  ← gọi thẳng localhost:8001, tự gửi Bearer ${API_KEY}
 ```
 
 ---
@@ -254,3 +315,7 @@ curl "$RERANK_URL/v1/rerank" \
 nginx **injects** `Authorization: Bearer ${API_KEY}` upstream — clients không cần gửi key.
 An toàn sau firewall/VPN. Nếu expose public IP: xoá dòng `proxy_set_header Authorization`
 trong `nginx/default.conf.template` (hoặc `nginx/cpu.conf.template`) để vLLM/LiteLLM tự validate.
+
+**Môi trường 1b (single GPU) không có nginx** — port vLLM publish thẳng ra host, nên
+client PHẢI tự gửi `Authorization: Bearer ${API_KEY}` (vLLM validate). `bench*.py` đã
+gửi sẵn. Chỉ chạy sau firewall/VPN, đừng để port 8000/8001/8002 ra public IP.
