@@ -1,13 +1,32 @@
-# vLLM Serving Stack — 2× RTX 6000 Pro (Blackwell)
+# vLLM Serving Stack
 
-OpenAI-compatible LLM + embedding + reranker, fully Dockerized, with centralized
-GPU + log monitoring. **`docker compose up -d` brings up everything.**
+OpenAI-compatible **LLM + Embedding + Reranker**, fully Dockerized. Ba cách triển khai
+tuỳ theo tài nguyên sẵn có — cùng port, cùng API, client không cần đổi code.
 
-## Why this layout
+| Port | Service | Endpoint |
+|------|---------|----------|
+| **8001** | LLM | `POST /v1/chat/completions` |
+| **8000** | Embedding | `POST /v1/embeddings` |
+| **8002** | Reranker | `POST /v1/rerank` |
+| **3000** | Grafana (monitoring) | — |
 
-The RTX 6000 Pro Blackwell (96 GB GDDR7) is **PCIe-only — no NVLink P2P**.
-Tensor-parallel across the two cards would bottleneck on the PCIe bus, so instead
-each GPU runs a **full independent replica** and nginx load-balances across them:
+---
+
+## Chọn môi trường
+
+```
+Có 2× RTX 6000 Pro (96 GB, Blackwell)?  →  Môi trường 1: GPU (production, nginx LB + monitoring)
+Chỉ có 1× RTX 6000 Pro, muốn bench?      →  Môi trường 1b: Single GPU (gọn, không nginx/monitoring)
+Có 2× A100 80GB (Ampere)?               →  Môi trường 1c: A100 (production, AWQ int4 + nginx LB + monitoring)
+Chỉ có Colab / cloud GPU đơn?           →  Môi trường 2: Colab
+Máy thường, không GPU?                  →  Môi trường 3: No-GPU + DeepSeek API
+```
+
+---
+
+## Môi trường 1 — GPU (2× RTX 6000 Pro, production)
+
+Chạy toàn bộ 3 model local trên 2 GPU Blackwell. nginx load-balance 2 replica → ~2× throughput + HA.
 
 ```
 GPU 0 ── llm-0 (NVFP4) ── embedding-0 ── reranker-0  ┐
@@ -15,79 +34,263 @@ GPU 0 ── llm-0 (NVFP4) ── embedding-0 ── reranker-0  ┐
 GPU 1 ── llm-1 (NVFP4) ── embedding-1 ── reranker-1  ┘
 ```
 
-No cross-GPU NCCL traffic happens at all (TP=1 per replica), so the missing P2P
-link is irrelevant — and you get ~2× LLM throughput plus HA: if one card's
-replica dies, nginx routes to the other.
+| Model | Spec |
+|-------|------|
+| LLM | `nvidia/Qwen3.6-35B-A3B-NVFP4` — NVFP4 native Blackwell (SM120), FP8 KV cache |
+| Embedding | `BAAI/bge-m3` — multilingual, 1024-dim, fp16 |
+| Reranker | `Qwen/Qwen3-Reranker-0.6B` — causal-LM reranker, pooling runner |
 
-The LLM is **`nvidia/Qwen3.6-35B-A3B-NVFP4`** — NVFP4 is the native fast path on
-Blackwell (SM120). NVFP4 weights are ~20 GB, and `--kv-cache-dtype fp8` halves
-KV memory, so a single card has huge headroom for context + the two small models.
-
-| Public port | Service | Model | Endpoint |
-|------|---------|-------|----------|
-| 8001 | LLM | nvidia/Qwen3.6-35B-A3B-NVFP4 (NVFP4, FP8 KV) | `POST /v1/chat/completions` |
-| 8000 | Embedding | BAAI/bge-m3 (multilingual, 1024-d) | `POST /v1/embeddings` |
-| 8002 | Reranker | Qwen/Qwen3-Reranker-0.6B | `POST /v1/rerank` · `/v1/score` |
-
-**Observability is unified behind one port** — open **`:3000` (Grafana)** and
-that's it. Prometheus, the DCGM GPU exporter, cAdvisor, and Loki run as
-**internal-only** services on the Docker network; Grafana queries them by name,
-so you never visit their ports.
-
-| Observability port | Service |
-|------|---------|
-| 3000 | **Grafana** — the single pane: GPU dashboards + searchable logs of all containers |
-| _internal_ | Prometheus (metrics) · DCGM (GPU) · cAdvisor (containers) · Loki (logs) |
-
----
-
-## Quick start
-
-```bash
-# 1. Host prep (Docker + NVIDIA Container Toolkit). Run once, as root.
-bash setup.sh
-
-# 2. Configure
-cp .env.example .env
-nano .env            # set API_KEY and HF_TOKEN
-
-# 3. Launch the whole stack (6 vLLM replicas + nginx + monitoring)
-docker compose up -d
-
-# 4. Watch it come up
-bash status.sh
-docker compose logs -f llm-0      # first boot downloads the model (~20 GB)
+**VRAM mỗi card (96 GB):**
+```
+LLM      (NVFP4 ~20 GB weights + FP8 KV)  util 0.80  ≈ 77 GB
+Embedding (bge-m3, fp16)                  util 0.05  ≈  5 GB
+Reranker  (Qwen3-Reranker, fp16)          util 0.06  ≈  6 GB
+                                          ─────────────────
+                                          ≈ 88 GB / 96 GB
 ```
 
-First boot pulls the NVFP4 weights into `./models/` (persisted, so restarts are
-fast). Services report `:8001 (llm) OK` in `status.sh` once ready.
+**Khởi động:**
+```bash
+# 1. Host prep — Docker + NVIDIA Container Toolkit (chạy 1 lần, root)
+bash setup.sh
+
+# 2. Cấu hình
+cp .env.example .env
+nano .env          # set API_KEY, HF_TOKEN
+
+# 3. Lên toàn bộ stack (6 vLLM replica + nginx + monitoring)
+docker compose up -d
+
+# 4. Kiểm tra
+bash status.sh
+docker compose logs -f llm-0    # lần đầu tải model ~20 GB
+```
+
+**Thao tác thường dùng:**
+```bash
+docker compose ps
+docker compose logs -f llm-0
+docker compose restart llm-1
+docker compose down
+bash status.sh
+```
+
+**Files chính:**
+```
+docker-compose.yml          ← toàn bộ stack (YAML anchor: *vllm-common, *gpu0/gpu1)
+.env.example                ← biến cấu hình
+setup.sh / status.sh
+nginx/default.conf.template ← LB + auth (envsubst khi boot)
+monitoring/                 ← Prometheus · DCGM · cAdvisor · Loki · Grafana
+```
 
 ---
 
-## Centralized monitoring (single pane of glass)
+## Môi trường 1b — Single GPU (1× RTX 6000 Pro, để bench)
 
-Open **http://localhost:3000** (Grafana, default `admin` / `admin` — change in
-`.env`). The pre-provisioned **"vLLM Serving — GPU & Logs"** dashboard shows:
+Bản rút gọn của môi trường 1 cho **1 card duy nhất**: cả 3 model chạy trên GPU 0,
+**không nginx, không monitoring**. Port vLLM publish thẳng ra host nên client/bench
+gọi trực tiếp — vLLM tự validate `--api-key`. Dùng để đo throughput/latency thuần
+trước khi lên cấu hình 2-GPU production.
 
-- **GPU panels** (NVIDIA DCGM): utilization, VRAM used, temperature, power, clocks — per card.
-- **Logs panel** (Loki): live, searchable logs of every container. Use the
-  **Container** dropdown to filter to `llm-0`, `embedding-1`, `nginx`, etc.
+```
+GPU 0 ── llm (NVFP4)  :8001
+      ── embedding    :8000
+      ── reranker     :8002   ──► clients / bench*.py
+```
 
-How the logs get there: **Promtail** tails every container via the Docker socket
-and ships them to **Loki**; **Prometheus** scrapes **DCGM** (GPUs) and **cAdvisor**
-(containers). Nothing to wire up — it's all in `docker compose up`.
+**VRAM (96 GB):** `LLM 0.80 (~77) + embed 0.05 (~5) + rerank 0.06 (~6) ≈ 88 / 96 GB`.
 
-Prefer the terminal? `docker compose logs -f` (all) or `docker compose logs -f llm-0`.
+> **Card phải là RTX 6000 Pro Blackwell (SM120).** `--quantization modelopt` (NVFP4)
+> chỉ chạy native trên Blackwell. Trên **RTX 6000 Ada (48 GB)**: NVFP4 không support
+> và 0.80×48 GB không đủ cho model 35B → đổi `LLM_MODEL` sang build int4/fp8 + hạ util.
+
+**Khởi động:**
+```bash
+# 1. Host prep (chạy 1 lần, root) — giống môi trường 1
+bash setup.sh
+
+# 2. Cấu hình — dùng CHUNG .env với môi trường 1
+cp .env.example .env
+nano .env          # set API_KEY, HF_TOKEN
+
+# 3. Lên 3 service trên GPU 0 (không nginx/monitoring)
+docker compose -f docker-compose.single.yml up -d
+
+# 4. Theo dõi tải model (lần đầu ~20 GB) + kiểm tra
+docker compose -f docker-compose.single.yml ps
+docker compose -f docker-compose.single.yml logs -f llm
+nvidia-smi
+```
+
+**Bench (sau khi 3 service `Ready`):**
+```bash
+pip install aiohttp openai
+python bench.py            # throughput LLM @ C=1,2,4,8 → tok/s, ttfb
+python bench_stress.py     # tải nặng hơn
+# bench_ccu.py: dành cho test CCU (chưa cần ở bước này)
+```
+
+**Thao tác thường dùng:**
+```bash
+docker compose -f docker-compose.single.yml restart llm
+docker compose -f docker-compose.single.yml down
+```
+
+**Files:**
+```
+docker-compose.single.yml   ← 3 service trên GPU 0, port publish thẳng (không nginx)
+.env.example                ← dùng chung với môi trường 1
+bench.py / bench_stress.py  ← gọi thẳng localhost:8001, tự gửi Bearer ${API_KEY}
+```
 
 ---
 
-## API usage
+## Môi trường 1c — 2× A100 80GB (Ampere, production)
 
-**Auth:** nginx injects the shared key, so clients hit the public ports **without**
-a token. (Keep the ports behind a firewall, or add your own auth — see Security.)
+Giống môi trường 1 (full stack: 6 replica + nginx LB + monitoring) nhưng cho **A100**.
+A100 là Ampere (SM80): **không có NVFP4** (cần SM≥89) và **không có FP8 W8A8** (Hopper/Ada),
+nên LLM đổi sang bản **AWQ int4** chạy qua Marlin (`awq_marlin`) — fast path của Ampere.
+Mỗi card 1 replica đầy đủ (TP=1), nginx LB 2 card → ~2× throughput + HA.
+
+```
+GPU 0 ── llm-0 (AWQ int4) ── embedding-0 ── reranker-0  ┐
+                                                        ├─► nginx LB ─► clients
+GPU 1 ── llm-1 (AWQ int4) ── embedding-1 ── reranker-1  ┘
+```
+
+| Model | Spec |
+|-------|------|
+| LLM | `cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit` — int4, `awq_marlin`, tool-parser hermes |
+| Embedding | `BAAI/bge-m3` — multilingual, 1024-dim, fp16 (giống môi trường 1) |
+| Reranker | `Qwen/Qwen3-Reranker-0.6B` — causal-LM reranker, pooling runner (giống môi trường 1) |
+
+**VRAM mỗi card (80 GB):** `LLM int4 ~18 GB weights + KV @0.80 (~64) + embed 0.05 (~4) + rerank 0.06 (~5) ≈ 73 / 80 GB`.
+
+**Khởi động:**
+```bash
+cd a100
+bash setup.sh                 # host prep (Docker + NVIDIA toolkit), chạy 1 lần, root
+cp .env.example .env          # set API_KEY, HF_TOKEN
+docker compose up -d          # 6 vLLM replica + nginx + monitoring
+bash status.sh                # health + GPU; lần đầu tải LLM int4 ~18 GB
+```
+
+> Stack A100 **dùng chung port + tên container** với môi trường 1 → chỉ chạy **một
+> trong hai** trên cùng host (1 host chỉ có 1 loại card). Cấu hình nginx + monitoring +
+> reranker template + HF cache được **tái dùng** từ repo root qua `../`. Chi tiết: `a100/README.md`.
+
+---
+
+## Môi trường 2 — Colab (single GPU qua Cloudflare tunnel)
+
+Dùng khi chỉ có GPU đơn từ Google Colab, Kaggle, hoặc cloud free-tier.
+Notebook **tự dò GPU → tự chọn model phù hợp → serve 3 dịch vụ → mở Cloudflare tunnel → in public URL**.
+
+| GPU | Model LLM tự chọn |
+|-----|-------------------|
+| H100 (80 GB) | Qwen3-30B-A3B FP8 |
+| A100-80 GB | Qwen3-30B-A3B int4 |
+| A100-40 GB / 48 GB | Qwen3-30B-A3B int4 |
+| 24 GB (3090/4090) | Qwen3-14B int4 |
+| 16 GB / T4 | Qwen3-7B int4 |
+
+Embedding và Reranker luôn là `BAAI/bge-m3` + `Qwen/Qwen3-Reranker-0.6B`, serve tuần tự (không tràn VRAM).
+
+**Khởi động:**
+1. Mở notebook `colab/00_auto_serve_anygpu.ipynb` trên Colab
+2. Chạy một cell duy nhất — tự động hoàn toàn
+3. Notebook in ra URL dạng `https://xxxx.trycloudflare.com`
+4. Dùng URL đó như `LLM_URL` / `EMB_URL` / `RERANK_URL`
+
+**Files:**
+```
+colab/00_auto_serve_anygpu.ipynb   ← notebook tự dò GPU, dùng cho mọi loại
+colab/serve_a100.ipynb             ← tuned cho A100
+colab/serve_h100.ipynb             ← tuned cho H100
+```
+
+---
+
+## Môi trường 3 — No-GPU (CPU + DeepSeek API)
+
+Dùng khi không có GPU. LLM gọi qua **DeepSeek API** (cloud), Embedding + Reranker chạy **local trên CPU**.
+Cùng port, cùng API — client không đổi gì.
+
+```
+CPU server (không cần GPU)
+
+  embedding  (BAAI/bge-m3, CPU)          → :8000
+  litellm    (proxy → DeepSeek API)      → :8001   → api.deepseek.com
+  reranker   (Qwen3-Reranker-0.6B, CPU) → :8002
+                    ↕
+              nginx :8000/8001/8002 → clients
+```
+
+| Service | Image | Ghi chú |
+|---------|-------|---------|
+| Embedding | `secai-embedding:bge-m3` (build local) | SentenceTransformer, dim=1024 |
+| LLM proxy | `secai-litellm:local` (build local) | LiteLLM → DeepSeek V4 Pro |
+| Reranker | `secai-reranker:qwen3` (build local) | CausalLM yes/no logit scoring |
+
+**Model LLM hỗ trợ (qua LiteLLM — `litellm/config.yml`):**
+| Gọi với `model` | Thực tế |
+|---|---|
+| `deepseek-v4-pro` | DeepSeek V4 Pro — reasoning, coding |
+| `deepseek-v4-flash` | DeepSeek V4 Flash — nhanh, rẻ hơn |
+| `deepseek-chat` | alias → V4 Pro (deprecated 2026-07-24) |
+| `deepseek-reasoner` | alias → V4 Pro (deprecated 2026-07-24) |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | alias → V4 Pro (backward compat) |
+
+**Khởi động:**
+```bash
+# 1. Setup host — chỉ Docker, không cần NVIDIA toolkit
+bash setup-cpu.sh
+
+# 2. Cấu hình — điền DeepSeek API key
+cp .env.cpu.example .env.cpu
+nano .env.cpu     # set DEEPSEEK_API_KEY=sk-...
+
+# 3. Build image + start (lần đầu build ~5 phút, download model ~3.6 GB)
+docker compose -f docker-compose-cpu.yml --env-file .env.cpu up -d --build
+
+# 4. Kiểm tra
+bash status-cpu.sh
+```
+
+**Nếu kết nối với backend trên cùng máy** (ví dụ secai-allinone):
+```bash
+# Join 3 container vào network của backend rồi cập nhật URL
+docker network connect <backend-network> embedding
+docker network connect <backend-network> litellm
+docker network connect <backend-network> reranker
+
+# Backend gọi bằng container name:
+# LLM   → http://litellm:8001/v1
+# Embed → http://embedding:8000
+# Rerank→ http://reranker:8002
+```
+
+**Files chính:**
+```
+docker-compose-cpu.yml          ← stack CPU (embedding + litellm + reranker + nginx + monitoring)
+.env.cpu.example                ← template — thêm DEEPSEEK_API_KEY
+setup-cpu.sh / status-cpu.sh
+nginx/cpu.conf.template         ← single upstream (không LB)
+litellm/config.yml              ← model mapping → DeepSeek API
+reranker-cpu/
+  Dockerfile                    ← python:3.11-slim + transformers (CPU torch)
+  server.py                     ← CausalLM yes/no logit scoring cho Qwen3-Reranker
+monitoring/
+  prometheus/prometheus-cpu.yml ← scrape cAdvisor (không có DCGM)
+  grafana/dashboards-cpu/       ← CPU/memory dashboard
+```
+
+---
+
+## API usage (giống nhau cho cả 3 môi trường)
 
 ```bash
-API_KEY="sk-..."                  # only needed if you add client-side auth
 LLM_URL="http://<host>:8001"
 EMB_URL="http://<host>:8000"
 RERANK_URL="http://<host>:8002"
@@ -100,35 +303,19 @@ curl "$LLM_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Hello, how are you?"}
-    ],
-    "temperature": 0.7,
+    "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 1024
   }'
 ```
 
 ```python
 from openai import OpenAI
-
-client = OpenAI(base_url=f"{LLM_URL}/v1", api_key=API_KEY)
-
-completion = client.chat.completions.create(
-    model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+client = OpenAI(base_url=f"{LLM_URL}/v1", api_key="sk-...")
+resp = client.chat.completions.create(
+    model="nvidia/Qwen3.6-35B-A3B-NVFP4",   # hoặc "deepseek-v4-pro" (môi trường 3)
     messages=[{"role": "user", "content": "Hello!"}],
 )
-print(completion.choices[0].message.content)
-
-# Streaming
-stream = client.chat.completions.create(
-    model="nvidia/Qwen3.6-35B-A3B-NVFP4",
-    messages=[{"role": "user", "content": "Tell me a short story."}],
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
+print(resp.choices[0].message.content)
 ```
 
 ### Embedding
@@ -140,7 +327,7 @@ curl "$EMB_URL/v1/embeddings" \
 ```
 
 ```python
-client = OpenAI(base_url=f"{EMB_URL}/v1", api_key=API_KEY)
+client = OpenAI(base_url=f"{EMB_URL}/v1", api_key="sk-...")
 r = client.embeddings.create(model="BAAI/bge-m3", input="Hello world")
 print(len(r.data[0].embedding))   # 1024
 ```
@@ -148,86 +335,24 @@ print(len(r.data[0].embedding))   # 1024
 ### Reranker
 
 ```bash
-# Cohere-style list rerank
 curl "$RERANK_URL/v1/rerank" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Reranker-0.6B",
     "query": "capital of France",
-    "documents": ["Paris is the capital of France.", "Berlin is the capital of Germany."],
+    "documents": ["Paris is the capital.", "Berlin is the capital of Germany."],
     "top_n": 2
   }'
-
-# Pairwise score
-curl "$RERANK_URL/v1/score" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen/Qwen3-Reranker-0.6B", "text_1": "What is AI?", "text_2": "AI is artificial intelligence."}'
 ```
 
 ---
 
-## Operations
+## Security
 
-```bash
-docker compose up -d            # start everything
-docker compose ps               # what's running
-docker compose logs -f llm-0    # follow one replica
-docker compose restart llm-1    # restart a single replica
-docker compose down             # stop everything (keeps models + volumes)
-docker compose pull             # update images, then `up -d` again
-bash status.sh                  # health + GPU + endpoint check
-```
+nginx **injects** `Authorization: Bearer ${API_KEY}` upstream — clients không cần gửi key.
+An toàn sau firewall/VPN. Nếu expose public IP: xoá dòng `proxy_set_header Authorization`
+trong `nginx/default.conf.template` (hoặc `nginx/cpu.conf.template`) để vLLM/LiteLLM tự validate.
 
-### Scale / tune
-
-- **Context length:** raise `LLM_MAX_MODEL_LEN` in `.env` (NVFP4 + FP8 KV leaves
-  room toward the model's full 262 144 window).
-- **VRAM split per card:** in `docker-compose.yml`, `--gpu-memory-utilization`
-  is `0.80` (LLM) / `0.05` (embed) / `0.06` (rerank) → ~87 GB of 96 GB used.
-- **Optional Blackwell tuning:** the model card also suggests
-  `--moe-backend marlin` and `--attention-backend flashinfer`; add them to the
-  `llm-cmd` block if your vLLM build supports them.
-
----
-
-## GPU memory layout (per 96 GB card)
-
-```
-LLM  (NVFP4 ~20 GB weights + FP8 KV cache)   util 0.80  ≈ 77 GB
-Embedding (bge-m3, fp16)                      util 0.05  ≈  5 GB
-Reranker  (Qwen3-Reranker-0.6B, fp16)         util 0.06  ≈  6 GB
-                                              ─────────────────
-                                              ≈ 88 GB / 96 GB
-```
-
----
-
-## Security note
-
-nginx **injects** the API key, so anything that can reach ports 8000/8001/8002
-gets free access. That's convenient behind a firewall/VPN but unsafe on a public
-IP. To require client auth instead, edit `nginx/default.conf.template`: remove the
-`proxy_set_header Authorization ...` lines so the client's own
-`Authorization: Bearer` header is passed through to vLLM (which validates it).
-
----
-
-## Files
-
-```
-├── docker-compose.yml              ← the whole stack (serving + monitoring)
-├── .env.example                    ← config template
-├── setup.sh                        ← host prep: Docker + NVIDIA toolkit
-├── status.sh                       ← health / GPU / endpoint check
-├── nginx/
-│   └── default.conf.template       ← load-balancer + auth (envsubst'd at boot)
-├── monitoring/
-│   ├── prometheus/prometheus.yml   ← scrape DCGM + cAdvisor
-│   ├── loki/loki-config.yml        ← log store
-│   ├── promtail/promtail-config.yml← ship container logs → Loki
-│   └── grafana/
-│       ├── provisioning/           ← datasources + dashboard providers
-│       └── dashboards/vllm-stack.json  ← GPU + logs dashboard
-├── bench.py / bench_ccu.py / bench_stress.py   ← throughput benchmarks
-└── models/                         ← HF model cache (persisted)
-```
+**Môi trường 1b (single GPU) không có nginx** — port vLLM publish thẳng ra host, nên
+client PHẢI tự gửi `Authorization: Bearer ${API_KEY}` (vLLM validate). `bench*.py` đã
+gửi sẵn. Chỉ chạy sau firewall/VPN, đừng để port 8000/8001/8002 ra public IP.
