@@ -34,6 +34,21 @@ for name in embed-0 llm-0 rerank-0 embed-1 llm-1 rerank-1; do
     [ "$status" = "200" ] && echo "  $name   OK ($url)" || echo "  $name   $status ($url)"
 done
 
+# ── nginx LB health ─────────────────────────────────────────────────────────
+echo ""
+echo "=== nginx LB ==="
+NGINX_PIDFILE="/tmp/vllm-a100-nginx.pid"
+if [ -f "$NGINX_PIDFILE" ] && kill -0 "$(cat "$NGINX_PIDFILE")" 2>/dev/null; then
+    for label in "embed:8000" "llm:8001" "rerank:8002"; do
+        name="${label%%:*}"
+        port="${label##*:}"
+        status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:$port/health" 2>/dev/null || echo "000")
+        [ "$status" = "200" ] && echo "  nginx → :$port ($name)  OK" || echo "  nginx → :$port ($name)  $status"
+    done
+else
+    echo "  (nginx not running — direct backend ports only)"
+fi
+
 # ── API smoke test ──────────────────────────────────────────────────────────
 echo ""
 echo "=== API Smoke Test ==="

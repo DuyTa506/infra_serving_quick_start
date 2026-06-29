@@ -23,4 +23,15 @@ for pidfile in /tmp/vllm-a100-*.pid; do
     rm -f "$pidfile"
 done
 
+# ── nginx ────────────────────────────────────────────────────────────────────
+NGINX_PIDFILE="/tmp/vllm-a100-nginx.pid"
+if [ -f "$NGINX_PIDFILE" ]; then
+    pid=$(cat "$NGINX_PIDFILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  [stop] nginx (pid $pid)"
+        nginx -s quit 2>/dev/null || kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$NGINX_PIDFILE"
+fi
+
 echo "Done."

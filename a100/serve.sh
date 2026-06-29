@@ -54,16 +54,36 @@ _launch() {
 
     if _is_running "$name"; then
         echo "  [skip] $name already running (pid $(cat "$pidfile"))"
-        return
+        return 0
     fi
 
     echo "  [start] $name → 127.0.0.1:$port (GPU $gpu)"
+    # TP=1 per replica → no P2P needed. Disable to avoid cross-GPU memory errors
+    # on A100s with NVLink where another process may have enabled P2P.
     CUDA_VISIBLE_DEVICES="$gpu" \
+    NCCL_P2P_DISABLE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         nohup vllm serve "$@" \
             --host 127.0.0.1 --port "$port" \
             --api-key "$API_KEY" \
             >> "$logfile" 2>&1 &
     echo $! > "$pidfile"
+
+    # Wait for this service to finish loading before launching next on same GPU.
+    # Prevents OOM races when multiple services compete for VRAM.
+    echo -n "    waiting for $name to load..."
+    for i in $(seq 1 300); do
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null; then
+            echo " ready (${i}s)"
+            break
+        fi
+        if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+            echo " FAILED — check $logfile"
+            return 1
+        fi
+        sleep 2
+        [ $((i % 15)) -eq 0 ] && echo -n " ${i}s..."
+    done
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -149,10 +169,36 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "rerank" ] || [ "$MODE" = "rerank-1" ]; th
         --trust-remote-code
 fi
 
+# ── nginx (optional — load balancer) ─────────────────────────────────────────
+NGINX_PIDFILE="/tmp/vllm-a100-nginx.pid"
+if [ "$MODE" = "all" ] || [ "$MODE" = "nginx" ]; then
+    if command -v nginx &>/dev/null; then
+        if [ -f "$NGINX_PIDFILE" ] && kill -0 "$(cat "$NGINX_PIDFILE")" 2>/dev/null; then
+            echo "  [skip] nginx already running"
+        else
+            echo "  [start] nginx → :8000 (embed)  :8001 (llm)  :8002 (rerank)"
+            cp -f "$SCRIPT_DIR/nginx.conf" /etc/nginx/sites-available/vllm-stack 2>/dev/null || true
+            mkdir -p /etc/nginx/sites-enabled
+            ln -sf /etc/nginx/sites-available/vllm-stack /etc/nginx/sites-enabled/vllm-stack 2>/dev/null || true
+            rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+            nginx -t && nginx || true
+            # Store nginx master PID for stop.sh
+            pgrep -f "nginx: master" | head -1 > "$NGINX_PIDFILE" 2>/dev/null || true
+        fi
+    else
+        echo "  [warn] nginx not installed — skipping LB. Install: apt install -y nginx"
+    fi
+fi
+
 echo ""
 echo "=== Done ==="
-echo "  GPU 0:  embed → :18000   llm → :18001   rerank → :18002"
-echo "  GPU 1:  embed → :18010   llm → :18011   rerank → :18012"
+echo "  Direct (backend):"
+echo "    GPU 0:  embed → :18000   llm → :18001   rerank → :18002"
+echo "    GPU 1:  embed → :18010   llm → :18011   rerank → :18012"
+if [ -f "$NGINX_PIDFILE" ] && kill -0 "$(cat "$NGINX_PIDFILE")" 2>/dev/null; then
+    echo "  nginx LB (frontend):"
+    echo "    :8000 → embedding   :8001 → llm   :8002 → reranker"
+fi
 echo ""
 echo "  bash status.sh       # health check"
 echo "  bash stop.sh         # kill all"
