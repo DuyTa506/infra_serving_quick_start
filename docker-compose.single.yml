@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  vLLM Serving Stack — SINGLE GPU (1× RTX 6000 Pro, Blackwell, 96 GB)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Bản rút gọn để BENCH trên 1 card: cả 3 dịch vụ (LLM + embedding + reranker)
+#  chạy trên GPU 0, KHÔNG nginx, KHÔNG monitoring. Port container publish thẳng
+#  ra host nên client/bench gọi trực tiếp vLLM. vLLM tự validate --api-key, nên
+#  bench*.py (gửi sẵn Bearer ${API_KEY}) chạy không cần sửa.
+#
+#    GPU 0 ── llm (NVFP4)  :8001
+#          ── embedding    :8000
+#          ── reranker     :8002   ──► clients / bench*.py
+#
+#  VRAM (96 GB):  LLM 0.80 (~77) + embed 0.05 (~5) + rerank 0.06 (~6) ≈ 88 GB.
+#
+#  Dùng cùng .env với stack production:
+#    docker compose -f docker-compose.single.yml up -d
+#
+#  LƯU Ý: --quantization modelopt (NVFP4) chỉ chạy trên Blackwell (SM120). Trên
+#  RTX 6000 Ada (48 GB) phải đổi LLM_MODEL sang build int4/fp8 + hạ util.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-vllm-common: &vllm-common
+  image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+  ipc: host
+  restart: unless-stopped
+  volumes:
+    - ./models:/root/.cache/huggingface
+    - ./templates:/templates:ro
+  environment:
+    - HF_HOME=/root/.cache/huggingface
+    - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    - API_KEY=${API_KEY:-}
+  networks: [serving]
+  # Pin cả 3 dịch vụ vào MỘT card (device 0).
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+
+services:
+
+  llm:
+    <<: *vllm-common
+    container_name: llm
+    ports:
+      - "8001:8001"   # POST /v1/chat/completions
+    command: [
+      "--model", "${LLM_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}",
+      "--host", "0.0.0.0",
+      "--port", "8001",
+      "--api-key", "${API_KEY:-}",
+      "--quantization", "modelopt",
+      "--kv-cache-dtype", "fp8",
+      "--tensor-parallel-size", "1",
+      "--max-model-len", "${LLM_MAX_MODEL_LEN:-65536}",
+      "--max-num-batched-tokens", "16384",
+      "--gpu-memory-utilization", "0.80",
+      "--max-num-seqs", "128",
+      "--enable-prefix-caching",
+      "--reasoning-parser", "qwen3",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser", "qwen3_coder",
+      "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}",
+      "--trust-remote-code"
+    ]
+
+  embedding:
+    <<: *vllm-common
+    container_name: embedding
+    ports:
+      - "8000:8000"   # POST /v1/embeddings
+    command: [
+      "--model", "${EMBED_MODEL:-BAAI/bge-m3}",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--api-key", "${API_KEY:-}",
+      "--runner", "pooling",
+      "--dtype", "float16",
+      "--max-model-len", "512",
+      "--gpu-memory-utilization", "0.05",
+      "--trust-remote-code"
+    ]
+
+  reranker:
+    <<: *vllm-common
+    container_name: reranker
+    ports:
+      - "8002:8002"   # POST /v1/rerank, /v1/score
+    command: [
+      "--model", "${RERANK_MODEL:-Qwen/Qwen3-Reranker-0.6B}",
+      "--host", "0.0.0.0",
+      "--port", "8002",
+      "--api-key", "${API_KEY:-}",
+      "--runner", "pooling",
+      "--hf-overrides", "{\"architectures\": [\"Qwen3ForSequenceClassification\"], \"classifier_from_token\": [\"no\", \"yes\"], \"is_original_qwen3_reranker\": true}",
+      "--chat-template", "/templates/qwen3_reranker.jinja",
+      "--dtype", "float16",
+      "--max-model-len", "4096",
+      "--gpu-memory-utilization", "0.06",
+      "--trust-remote-code"
+    ]
+
+networks:
+  serving:
+    driver: bridge

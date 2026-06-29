@@ -1,0 +1,255 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  vLLM Serving Stack — 2x NVIDIA A100 80GB (Ampere, SM80)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Version riêng cho A100. A100 là Ampere (SM80): KHÔNG có NVFP4 (Blackwell ≥SM120)
+#  và KHÔNG có FP8 W8A8 (Hopper/Ada). Vì vậy LLM dùng AWQ int4 chạy qua Marlin
+#  (awq_marlin) — fast path của Ampere. Mọi thứ khác giữ nguyên triết lý repo:
+#  mỗi GPU chạy MỘT replica đầy đủ (LLM + embedding + reranker, TP=1) và nginx
+#  load-balance 2 replica → ~2x throughput + HA. Model int4 (~18 GB) thừa sức nằm
+#  gọn 1 card nên KHÔNG cần tensor-parallel (kể cả khi A100 có NVLink) → zero NCCL.
+#
+#    GPU 0 ── llm-0 (AWQ int4) ── embedding-0 ── reranker-0  ┐
+#                                                            ├─► nginx LB ─► clients
+#    GPU 1 ── llm-1 (AWQ int4) ── embedding-1 ── reranker-1  ┘
+#
+#  Public (host) ports — nginx round-robin / least-conn over both GPUs:
+#    8000  embedding   (POST /v1/embeddings)
+#    8001  llm         (POST /v1/chat/completions)   OpenAI-compatible
+#    8002  reranker    (POST /v1/rerank, /v1/score)
+#    3000  Grafana     — GPU dashboards (DCGM) + container logs (Loki); chỉ 1 UI
+#
+#  Cấu hình hardware-agnostic (nginx LB + monitoring + reranker template + HF cache)
+#  được TÁI DÙNG từ repo root qua bind-mount tương đối (../) để tránh drift.
+#  Chạy:  cd a100 && docker compose up -d
+#
+#  LƯU Ý: stack này dùng chung port + tên container với stack root (RTX 6000). Chỉ
+#  chạy MỘT trong hai trên cùng một host — điều này luôn đúng vì 1 host chỉ có 1
+#  loại card.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-vllm-common: &vllm-common
+  image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+  ipc: host
+  restart: unless-stopped
+  volumes:
+    - ../models:/root/.cache/huggingface     # HF cache dùng chung với stack root
+    - ../templates:/templates:ro             # reranker chat-template (reuse)
+  environment:
+    - HF_HOME=/root/.cache/huggingface
+    - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    - API_KEY=${API_KEY:-}
+  networks: [serving]
+
+# Reusable GPU reservation anchors (pin a service to ONE physical card)
+x-gpu0: &gpu0
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+x-gpu1: &gpu1
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["1"]
+            capabilities: [gpu]
+
+services:
+
+  # ═══════════════════════════════ GPU 0 ═══════════════════════════════════════
+  llm-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: llm-0
+    command: &llm-cmd [
+      "--model", "${LLM_MODEL:-cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit}",
+      "--host", "0.0.0.0",
+      "--port", "8001",
+      "--api-key", "${API_KEY:-}",
+      "--quantization", "awq_marlin",
+      "--tensor-parallel-size", "1",
+      "--max-model-len", "${LLM_MAX_MODEL_LEN:-32768}",
+      "--max-num-batched-tokens", "16384",
+      "--gpu-memory-utilization", "0.80",
+      "--max-num-seqs", "128",
+      "--enable-prefix-caching",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser", "hermes",
+      "--trust-remote-code"
+    ]
+    # So với &llm-cmd của stack root (RTX 6000 Blackwell) đã BỎ/ĐỔI cho A100/Ampere:
+    #   ĐỔI  --quantization modelopt → awq_marlin   (NVFP4 cần SM≥89; A100 là SM80)
+    #   BỎ   --kv-cache-dtype fp8                     (FP8 native là Hopper+; Ampere chỉ emulate)
+    #   BỎ   --speculative-config mtp                 (MTP gắn với bản NVFP4)
+    #   BỎ   --reasoning-parser qwen3                 (2507-Instruct là non-thinking)
+    #   ĐỔI  --tool-call-parser qwen3_coder → hermes  (parser của 2507-Instruct)
+
+  embedding-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: embedding-0
+    command: &embed-cmd [
+      "--model", "${EMBED_MODEL:-BAAI/bge-m3}",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--api-key", "${API_KEY:-}",
+      "--runner", "pooling",
+      "--dtype", "float16",
+      "--max-model-len", "512",
+      "--gpu-memory-utilization", "0.05",
+      "--trust-remote-code"
+    ]
+
+  reranker-0:
+    <<: [*vllm-common, *gpu0]
+    container_name: reranker-0
+    command: &rerank-cmd [
+      "--model", "${RERANK_MODEL:-Qwen/Qwen3-Reranker-0.6B}",
+      "--host", "0.0.0.0",
+      "--port", "8002",
+      "--api-key", "${API_KEY:-}",
+      "--runner", "pooling",
+      "--hf-overrides", "{\"architectures\": [\"Qwen3ForSequenceClassification\"], \"classifier_from_token\": [\"no\", \"yes\"], \"is_original_qwen3_reranker\": true}",
+      "--chat-template", "/templates/qwen3_reranker.jinja",
+      "--dtype", "float16",
+      "--max-model-len", "4096",
+      "--gpu-memory-utilization", "0.06",
+      "--trust-remote-code"
+    ]
+
+  # ═══════════════════════════════ GPU 1 ═══════════════════════════════════════
+  llm-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: llm-1
+    command: *llm-cmd
+
+  embedding-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: embedding-1
+    command: *embed-cmd
+
+  reranker-1:
+    <<: [*vllm-common, *gpu1]
+    container_name: reranker-1
+    command: *rerank-cmd
+
+  # ═══════════════════════════ nginx — load balancer ═══════════════════════════
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    depends_on: [llm-0, llm-1, embedding-0, embedding-1, reranker-0, reranker-1]
+    ports:
+      - "8000:8000"   # embedding   (LB over embedding-0, embedding-1)
+      - "8001:8001"   # llm         (LB over llm-0, llm-1)
+      - "8002:8002"   # reranker    (LB over reranker-0, reranker-1)
+    volumes:
+      # reuse repo-root nginx config; official image runs envsubst on *.template
+      - ../nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      - API_KEY=${API_KEY:-}
+      - NGINX_ENVSUBST_FILTER=API_KEY
+    networks: [serving]
+
+  # ═══════════════════════ Observability / central logging ═════════════════════
+
+  # Raw NVIDIA GPU metrics (utilization, VRAM, temp, power, ...) — both A100 cards
+  dcgm-exporter:
+    image: nvidia/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    container_name: dcgm-exporter
+    restart: unless-stopped
+    cap_add: [SYS_ADMIN]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    expose: ["9400"]
+    networks: [serving]
+
+  # Per-container CPU / memory / network
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    expose: ["8080"]
+    networks: [serving]
+
+  # Metric store — scrapes dcgm-exporter + cadvisor (config reused from repo root)
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    expose: ["9090"]
+    networks: [serving]
+
+  # Log store
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ../monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks: [serving]
+
+  # Ships ALL container logs (llm/embed/rerank/nginx/...) into Loki
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ../monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+    networks: [serving]
+
+  # Single pane of glass: GPU dashboards + searchable logs
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_DEFAULT_THEME=light
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus, loki]
+    networks: [serving]
+
+networks:
+  serving:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:
