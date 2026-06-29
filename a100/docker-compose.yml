@@ -1,17 +1,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  vLLM Serving Stack — 2x NVIDIA A100 80GB (Ampere, SM80)
+#  vLLM Serving Stack — 2× NVIDIA A100 80GB (Ampere, SM80)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  Version riêng cho A100. A100 là Ampere (SM80): KHÔNG có NVFP4 (Blackwell ≥SM120)
-#  và KHÔNG có FP8 W8A8 (Hopper/Ada). Vì vậy LLM dùng AWQ int4 chạy qua Marlin
-#  (awq_marlin) — fast path của Ampere. Mọi thứ khác giữ nguyên triết lý repo:
-#  mỗi GPU chạy MỘT replica đầy đủ (LLM + embedding + reranker, TP=1) và nginx
-#  load-balance 2 replica → ~2x throughput + HA. Model int4 (~18 GB) thừa sức nằm
-#  gọn 1 card nên KHÔNG cần tensor-parallel (kể cả khi A100 có NVLink) → zero NCCL.
+#  A100 = Ampere (SM80): NO NVFP4 (Blackwell ≥SM120) and NO FP8 W8A8 (Hopper/Ada).
+#  LLM: Qwen3.6-35B-A3B GPTQ INT4 (palmfuture, gptqmodel v2, g128, 23 GB).
+#  Pre-quantized — no local quantize step needed. Just docker compose up -d.
+#  Same repo philosophy: each GPU runs a FULL replica (LLM + embedding + reranker,
+#  TP=1) and nginx load-balances both → ~2× throughput + HA. GPTQ INT4 fits on one
+#  card with plenty of KV cache headroom — zero NCCL cross-GPU traffic.
 #
-#    GPU 0 ── llm-0 (AWQ int4) ── embedding-0 ── reranker-0  ┐
+#    GPU 0 ── llm-0 (GPTQ INT4) ── embedding-0 ── reranker-0  ┐
 #                                                            ├─► nginx LB ─► clients
-#    GPU 1 ── llm-1 (AWQ int4) ── embedding-1 ── reranker-1  ┘
+#    GPU 1 ── llm-1 (GPTQ INT4) ── embedding-1 ── reranker-1  ┘
 #
 #  Public (host) ports — nginx round-robin / least-conn over both GPUs:
 #    8000  embedding   (POST /v1/embeddings)
@@ -19,13 +19,12 @@
 #    8002  reranker    (POST /v1/rerank, /v1/score)
 #    3000  Grafana     — GPU dashboards (DCGM) + container logs (Loki); chỉ 1 UI
 #
-#  Cấu hình hardware-agnostic (nginx LB + monitoring + reranker template + HF cache)
-#  được TÁI DÙNG từ repo root qua bind-mount tương đối (../) để tránh drift.
-#  Chạy:  cd a100 && docker compose up -d
+#  Hardware-agnostic config (nginx LB + monitoring + reranker template + HF cache)
+#  is REUSED from repo root via relative bind-mounts (../) to prevent drift.
+#  Run:  cd a100 && docker compose up -d
 #
-#  LƯU Ý: stack này dùng chung port + tên container với stack root (RTX 6000). Chỉ
-#  chạy MỘT trong hai trên cùng một host — điều này luôn đúng vì 1 host chỉ có 1
-#  loại card.
+#  NOTE: this stack shares ports + container names with the root stack (RTX 6000).
+#  Only run ONE of the two on a given host — a host has one GPU type.
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-vllm-common: &vllm-common
@@ -66,27 +65,29 @@ services:
     <<: [*vllm-common, *gpu0]
     container_name: llm-0
     command: &llm-cmd [
-      "--model", "${LLM_MODEL:-cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit}",
+      "--model", "${LLM_MODEL:-palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4}",
       "--host", "0.0.0.0",
       "--port", "8001",
       "--api-key", "${API_KEY:-}",
-      "--quantization", "awq_marlin",
+      "--quantization", "gptq",
       "--tensor-parallel-size", "1",
-      "--max-model-len", "${LLM_MAX_MODEL_LEN:-32768}",
+      "--max-model-len", "${LLM_MAX_MODEL_LEN:-65536}",
       "--max-num-batched-tokens", "16384",
       "--gpu-memory-utilization", "0.80",
       "--max-num-seqs", "128",
       "--enable-prefix-caching",
+      "--reasoning-parser", "qwen3",
       "--enable-auto-tool-choice",
       "--tool-call-parser", "hermes",
+      "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}",
       "--trust-remote-code"
     ]
-    # So với &llm-cmd của stack root (RTX 6000 Blackwell) đã BỎ/ĐỔI cho A100/Ampere:
-    #   ĐỔI  --quantization modelopt → awq_marlin   (NVFP4 cần SM≥89; A100 là SM80)
-    #   BỎ   --kv-cache-dtype fp8                     (FP8 native là Hopper+; Ampere chỉ emulate)
-    #   BỎ   --speculative-config mtp                 (MTP gắn với bản NVFP4)
-    #   BỎ   --reasoning-parser qwen3                 (2507-Instruct là non-thinking)
-    #   ĐỔI  --tool-call-parser qwen3_coder → hermes  (parser của 2507-Instruct)
+    # vs root stack &llm-cmd (RTX 6000 Blackwell) — changed/dropped for A100/Ampere:
+    #   CHANGED  --quantization modelopt → gptq          (NVFP4 needs SM≥89; A100 gets GPTQ INT4)
+    #   DROPPED  --kv-cache-dtype fp8                     (FP8 native Hopper+; Ampere emulate only)
+    #   KEPT     --reasoning-parser qwen3                 (Qwen3.6 supports thinking mode)
+    #   KEPT     --speculative-config mtp                 (MTP weights in palmfuture quant — 1.7 GB)
+    #   CHANGED  --tool-call-parser qwen3_coder → hermes  (parser for instruct, not coder variant)
 
   embedding-0:
     <<: [*vllm-common, *gpu0]
