@@ -33,7 +33,7 @@ HF_TOKEN="${HF_TOKEN:-}"
 LLM_MODEL="${LLM_MODEL:-palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4}"
 EMBED_MODEL="${EMBED_MODEL:-BAAI/bge-m3}"
 RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-Reranker-0.6B}"
-LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-32768}"
+LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-65536}"
 
 HF_HOME="${HF_HOME:-$SCRIPT_DIR/../models}"
 export HF_HOME
@@ -58,10 +58,15 @@ _launch() {
     fi
 
     echo "  [start] $name → 127.0.0.1:$port (GPU $gpu)"
-    # TP=1 per replica → no P2P needed. Disable to avoid cross-GPU memory errors
-    # on A100s with NVLink where another process may have enabled P2P.
+    # TP=1 per replica → no P2P needed. Aggressively disable all cross-GPU paths:
+    # - CUDA_VISIBLE_DEVICES hides the other GPU
+    # - NCCL_P2P_DISABLE=1 prevents NCCL from using P2P (nvlink)
+    # - NCCL_NVLS_ENABLE=0 disables NVLink Sharp
+    # - VLLM_COMPILATION_CONFIG mode=0: disable torch inductor (avoids CUBLAS bugs)
     CUDA_VISIBLE_DEVICES="$gpu" \
     NCCL_P2P_DISABLE=1 \
+    NCCL_NVLS_ENABLE=0 \
+    VLLM_COMPILATION_CONFIG='{"mode":0}' \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         nohup vllm serve "$@" \
             --host 127.0.0.1 --port "$port" \
@@ -91,6 +96,18 @@ MODE="${1:-all}"
 
 echo "=== vLLM Stack — 2× A100 (no Docker) ==="
 echo "Logs: $LOGDIR/"
+
+# ── GPU reset (flush any stale P2P state from prior processes) ──────────────
+echo "Resetting GPU state..."
+python3 -c "
+import torch, gc
+for i in range(torch.cuda.device_count()):
+    torch.cuda.set_device(i)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+gc.collect()
+print('  GPUs reset OK')
+" 2>/dev/null || echo "  (GPU reset skipped)"
 echo ""
 
 # ── GPU 0 ───────────────────────────────────────────────────────────────────
@@ -101,6 +118,7 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "embed" ] || [ "$MODE" = "embed-0" ]; then
         --dtype float16 \
         --max-model-len 512 \
         --gpu-memory-utilization 0.05 \
+        --enforce-eager \
         --trust-remote-code
 fi
 
@@ -114,8 +132,10 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "llm" ] || [ "$MODE" = "llm-0" ]; then
         --gpu-memory-utilization 0.80 \
         --max-num-seqs 128 \
         --enable-prefix-caching \
+        --reasoning-parser qwen3 \
         --enable-auto-tool-choice \
         --tool-call-parser hermes \
+        --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
         --trust-remote-code
 fi
 
@@ -128,6 +148,7 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "rerank" ] || [ "$MODE" = "rerank-0" ]; th
         --dtype float16 \
         --max-model-len 4096 \
         --gpu-memory-utilization 0.06 \
+        --enforce-eager \
         --trust-remote-code
 fi
 
@@ -139,6 +160,7 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "embed" ] || [ "$MODE" = "embed-1" ]; then
         --dtype float16 \
         --max-model-len 512 \
         --gpu-memory-utilization 0.05 \
+        --enforce-eager \
         --trust-remote-code
 fi
 
@@ -166,6 +188,7 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "rerank" ] || [ "$MODE" = "rerank-1" ]; th
         --dtype float16 \
         --max-model-len 4096 \
         --gpu-memory-utilization 0.06 \
+        --enforce-eager \
         --trust-remote-code
 fi
 

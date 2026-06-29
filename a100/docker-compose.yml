@@ -71,20 +71,22 @@ services:
       "--api-key", "${API_KEY:-}",
       "--quantization", "gptq",
       "--tensor-parallel-size", "1",
-      "--max-model-len", "${LLM_MAX_MODEL_LEN:-32768}",
+      "--max-model-len", "${LLM_MAX_MODEL_LEN:-65536}",
       "--max-num-batched-tokens", "16384",
       "--gpu-memory-utilization", "0.80",
       "--max-num-seqs", "128",
       "--enable-prefix-caching",
+      "--reasoning-parser", "qwen3",
       "--enable-auto-tool-choice",
       "--tool-call-parser", "hermes",
+      "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}",
       "--trust-remote-code"
     ]
     # vs root stack &llm-cmd (RTX 6000 Blackwell) — changed/dropped for A100/Ampere:
     #   CHANGED  --quantization modelopt → gptq          (NVFP4 needs SM≥89; A100 gets GPTQ INT4)
     #   DROPPED  --kv-cache-dtype fp8                     (FP8 native Hopper+; Ampere emulate only)
-    #   DROPPED  --speculative-config mtp                 (MTP tied to NVFP4 build)
-    #   DROPPED  --reasoning-parser qwen3                 (GPTQ quant of base instruct)
+    #   KEPT     --reasoning-parser qwen3                 (Qwen3.6 supports thinking mode)
+    #   KEPT     --speculative-config mtp                 (MTP weights in palmfuture quant — 1.7 GB)
     #   CHANGED  --tool-call-parser qwen3_coder → hermes  (parser for instruct, not coder variant)
 
   embedding-0:
