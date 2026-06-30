@@ -70,7 +70,9 @@ services:
       "--host", "0.0.0.0",
       "--port", "8001",
       "--api-key", "${API_KEY:-}",
-      "--quantization", "awq_marlin",
+      # NO explicit --quantization: vLLM auto-detects from the model config. The default
+      # cpatonn build is `compressed-tensors` (NOT classic AWQ) — forcing awq_marlin errors
+      # out (validated on vast.ai A100). Auto-detect still uses Marlin int4 kernels on Ampere.
       "--tensor-parallel-size", "1",
       "--max-model-len", "${LLM_MAX_MODEL_LEN:-32768}",
       "--max-num-batched-tokens", "16384",
@@ -82,7 +84,8 @@ services:
       "--trust-remote-code"
     ]
     # So với &llm-cmd của stack root (RTX 6000 Blackwell) đã BỎ/ĐỔI cho A100/Ampere:
-    #   ĐỔI  --quantization modelopt → awq_marlin   (NVFP4 cần SM≥89; A100 là SM80)
+    #   BỎ   --quantization modelopt → để vLLM auto-detect (model cpatonn là compressed-tensors,
+    #        không phải AWQ cổ điển; ép awq_marlin sẽ lỗi mismatch. Ampere vẫn dùng Marlin int4)
     #   BỎ   --kv-cache-dtype fp8                     (FP8 native là Hopper+; Ampere chỉ emulate)
     #   BỎ   --speculative-config mtp                 (MTP gắn với bản NVFP4)
     #   BỎ   --reasoning-parser qwen3                 (2507-Instruct là non-thinking)

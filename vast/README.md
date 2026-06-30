@@ -35,11 +35,11 @@ VRAM mỗi card: `LLM 0.80 (~64) + embed 0.05 (~4) + rerank 0.06 (~5) ≈ 73 / 8
 ## Các bước triển khai
 
 ### 1. Thuê instance
-- Console vast.ai → **Templates** → chọn template **vLLM** (image `vllm/vllm-openai:latest`)
-  *hoặc* tạo template custom với image đó.
-- **Launch mode: SSH** (để On-start Script chạy).
-- **Filter máy:** `num_gpus = 2`, GPU = **A100 SXM4/PCIE 80GB**, Disk ≥ **80 GB** (HF cache + image).
-  CUDA ≥ 12.8 là dư cho `awq_marlin` (A100 nào cũng đủ).
+- Console vast.ai → tạo **Custom template** với image `vllm/vllm-openai:latest`
+  (đừng dùng template "vLLM" one-click — nó auto-serve sẵn 1 model, chiếm GPU + port 8000).
+- **Launch mode: SSH** ⟵ quan trọng: SSH mode *thay entrypoint gốc* → image **không auto-serve**.
+- **Filter máy:** `num_gpus = 2`, GPU = **A100 SXM4/PCIE 80GB**, **Disk ≥ 80 GB** (image vLLM ~10GB + model ~21GB).
+  CUDA ≥ 12.8 (A100 nào cũng đủ cho int4 Marlin).
 
 ### 2. Mở port (ô `-p` trong template)
 ```
@@ -49,23 +49,33 @@ vast.ai map mỗi port nội bộ → **external port ngẫu nhiên trên IP cô
 Sau khi máy lên, bấm **"IP Port Info"** để xem `PUBLIC_IP:EXTERNAL_PORT → 8001/...`.
 
 ### 3. Env vars (ô Environment Variables)
-Bắt buộc `API_KEY`, `HF_TOKEN`. Các biến khác xem [`.env.example`](./.env.example) (đều có default).
-```
-API_KEY=sk-secai2026
-HF_TOKEN=hf_xxx
-```
+- **`API_KEY`** — bắt buộc (bearer token, client phải gửi).
+- **`HF_TOKEN`** — *tuỳ chọn*: 3 model mặc định đều public nên không cần; chỉ set nếu đổi sang model gated hoặc muốn tải nhanh hơn.
 
-### 4. On-start Script
-Dán đoạn bootstrap này vào ô **On-start Script** (nó tải `vast/on_start.sh` từ repo rồi chạy):
+### 4. Deploy = `git clone` → chạy `on_start.sh`
+
+**Cách A — SSH vào rồi chạy tay (khuyến nghị: xem được log, debug dễ):**
+```bash
+ssh -p <PORT> root@<HOST>        # đúng lệnh ở nút "Connect" của instance
+git clone --depth 1 -b justtuananh \
+  https://github.com/DuyTa506/infra_serving_quick_start.git /opt/iss
+API_KEY=sk-secai2026 bash /opt/iss/vast/on_start.sh
+```
+> `on_start.sh` tự suy ra repo dir từ vị trí của nó (clone đâu cũng chạy, khỏi set `REPO_DIR`).
+> Muốn chạy nền + đóng SSH vẫn tiếp tục: `... setsid bash /opt/iss/vast/on_start.sh >/var/log/onstart_run.log 2>&1 </dev/null &`
+
+**Cách B — On-start Script tự động (deploy khỏi cần SSH):** đặt `API_KEY`(+`HF_TOKEN`) ở ô env, rồi dán vào ô **On-start Script**:
 ```bash
 set -e
-export REPO_URL=https://github.com/DuyTa506/infra_serving_quick_start.git REPO_REF=master
-git clone --depth 1 -b "$REPO_REF" "$REPO_URL" /opt/infra_serving_quick_start || true
-bash /opt/infra_serving_quick_start/vast/on_start.sh
+git clone --depth 1 -b justtuananh \
+  https://github.com/DuyTa506/infra_serving_quick_start.git /opt/iss || true
+bash /opt/iss/vast/on_start.sh        # API_KEY/HF_TOKEN lấy từ env template
 ```
-`on_start.sh` sẽ: cài nginx → launch 6 tiến trình vLLM (pin GPU 0/1, serve-args lấy từ `a100/`),
-**health-gate tuần tự trong mỗi GPU** (llm → embed → rerank, tránh OOM) → sinh nginx LB config →
-start nginx. Lần đầu tải model (~18 GB int4) có thể mất nhiều phút.
+
+`on_start.sh` làm gì: cài nginx → launch 6 tiến trình vLLM (pin GPU 0/1, serve-args = `a100/`,
+**quantization auto-detect** từ config model — compressed-tensors/AWQ đều chạy Marlin int4 trên Ampere)
+→ **health-gate tuần tự trong mỗi GPU** (llm → embed → rerank, tránh OOM) → sinh nginx LB config động
+→ start nginx. Lần đầu tải ~21 GB model có thể mất vài phút.
 
 ## Kiểm tra (sau khi instance lên)
 

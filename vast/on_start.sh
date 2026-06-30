@@ -45,6 +45,12 @@ EMBED_MODEL="${EMBED_MODEL:-BAAI/bge-m3}"
 RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-Reranker-0.6B}"
 
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-32768}"
+# Quantization: leave EMPTY to let vLLM auto-detect from the model's own config.
+# IMPORTANT: the default model (cpatonn/...-AWQ-4bit) is packed as `compressed-tensors`,
+# NOT classic AWQ — forcing `--quantization awq_marlin` raises a config-mismatch error.
+# Auto-detect handles both compressed-tensors and classic-AWQ builds (on Ampere both
+# dispatch to Marlin int4 kernels). Override only if you KNOW the build's format.
+LLM_QUANTIZATION="${LLM_QUANTIZATION:-}"
 LLM_GPU_UTIL="${LLM_GPU_UTIL:-0.80}"
 EMBED_GPU_UTIL="${EMBED_GPU_UTIL:-0.05}"
 RERANK_GPU_UTIL="${RERANK_GPU_UTIL:-0.06}"
@@ -62,10 +68,13 @@ RERANK_PORT_BASE="${RERANK_PORT_BASE:-18201}"
 
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1200}"   # seconds to wait per replica /health (cold pull is slow)
 
-# Repo (for the reranker jinja template + this dir). Override REPO_URL if you forked.
+# Repo (for the reranker jinja template). REPO_DIR defaults to the repo THIS script
+# lives in — so the documented flow `git clone <repo> X && bash X/vast/on_start.sh`
+# works with zero extra env. Only falls back to cloning if the template isn't found.
 REPO_URL="${REPO_URL:-https://github.com/DuyTa506/infra_serving_quick_start.git}"
 REPO_REF="${REPO_REF:-master}"
-REPO_DIR="${REPO_DIR:-/opt/infra_serving_quick_start}"
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(dirname "$_SCRIPT_DIR")}"
 
 # Persisted HuggingFace cache on the instance disk (survives container restart).
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
@@ -85,15 +94,15 @@ apt-get update -qq
 apt-get install -y -qq nginx git gettext-base curl >/dev/null
 # vLLM image already provides python3 + vllm; don't reinstall.
 
-# ── 2) Fetch repo (reranker jinja template lives here) ───────────────────────
-if [ ! -d "$REPO_DIR/.git" ]; then
-  echo "── cloning $REPO_URL ($REPO_REF) → $REPO_DIR ──"
-  git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$REPO_DIR"
-else
-  echo "── repo present at $REPO_DIR; pulling ──"
-  git -C "$REPO_DIR" pull --ff-only || true
-fi
+# ── 2) Locate repo files (reranker jinja). Clone only if not already present. ──
 RERANK_TEMPLATE="$REPO_DIR/templates/qwen3_reranker.jinja"
+if [ ! -f "$RERANK_TEMPLATE" ]; then
+  echo "── reranker template not under $REPO_DIR — cloning $REPO_URL ($REPO_REF) ──"
+  REPO_DIR=/opt/infra_serving_quick_start
+  [ -d "$REPO_DIR/.git" ] || git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$REPO_DIR"
+  RERANK_TEMPLATE="$REPO_DIR/templates/qwen3_reranker.jinja"
+fi
+echo "── using repo at $REPO_DIR ──"
 [ -f "$RERANK_TEMPLATE" ] || { echo "FATAL: missing $RERANK_TEMPLATE" >&2; exit 1; }
 
 # ── 3) GPU count ─────────────────────────────────────────────────────────────
@@ -128,12 +137,17 @@ wait_healthy() {  # port name
   return 1
 }
 
-# LLM serve-args == &llm-cmd in a100/docker-compose.yml (AWQ int4 / awq_marlin, Ampere fast path)
-llm_args() { echo \
-  --model "$LLM_MODEL" --quantization awq_marlin --tensor-parallel-size 1 \
-  --max-model-len "$LLM_MAX_MODEL_LEN" --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization "$LLM_GPU_UTIL" --max-num-seqs 128 \
-  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser hermes ; }
+# LLM serve-args (mirror &llm-cmd in a100/docker-compose.yml). Quantization is
+# auto-detected by default (LLM_QUANTIZATION empty) — see note above.
+llm_args() {
+  local q=""
+  [ -n "$LLM_QUANTIZATION" ] && q="--quantization $LLM_QUANTIZATION"
+  echo \
+    --model "$LLM_MODEL" $q --tensor-parallel-size 1 \
+    --max-model-len "$LLM_MAX_MODEL_LEN" --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization "$LLM_GPU_UTIL" --max-num-seqs 128 \
+    --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser hermes
+}
 
 # Embedding serve-args == &embed-cmd (bge-m3, pooling, 1024-d). Reranker == &rerank-cmd
 # (CAUSAL-LM reranker: needs --runner pooling + --hf-overrides + jinja, not just the id).

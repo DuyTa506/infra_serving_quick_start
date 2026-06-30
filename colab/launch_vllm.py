@@ -49,9 +49,12 @@ LLM_GPU_UTIL = os.environ.get("LLM_GPU_UTIL", "0.60")
 EMBED_GPU_UTIL = os.environ.get("EMBED_GPU_UTIL", "0.05")
 RERANK_GPU_UTIL = os.environ.get("RERANK_GPU_UTIL", "0.06")
 
-# AWQ on Ampere (A100) → the marlin kernel is the fast path. Override to "" to let vLLM
-# auto-detect, or to "gptq_marlin" if you point LLM_MODEL at a GPTQ build.
-LLM_QUANTIZATION = os.environ.get("LLM_QUANTIZATION", "awq_marlin")
+# Quantization: empty = let vLLM auto-detect from the model's config. The default model
+# (cpatonn/...-AWQ-4bit) is packed as `compressed-tensors`, NOT classic AWQ, so forcing
+# "awq_marlin" raises a config-mismatch error (validated on vast.ai A100). Auto-detect
+# handles both — on Ampere it still dispatches to Marlin int4 kernels. Override only if
+# you KNOW the build's format (e.g. "awq_marlin" for a classic AWQ build, "gptq_marlin" for GPTQ).
+LLM_QUANTIZATION = os.environ.get("LLM_QUANTIZATION", "")
 # 2507-Instruct is non-thinking → no reasoning parser. Tool calls use the hermes parser.
 LLM_TOOL_PARSER = os.environ.get("LLM_TOOL_PARSER", "hermes")
 
