@@ -1,0 +1,90 @@
+# ─── vLLM load balancer — vast.ai single-instance, 2× A100 (REFERENCE) ───────
+# This is the canonical 2-GPU shape that `vast/on_start.sh` generates at runtime
+# into /etc/nginx/conf.d/vllm.conf. The live config is produced by the script so
+# it adapts to the actual GPU count (1 or 2); this file is here to read/edit and
+# to document the design. If you want to pin a hand-written config, drop this into
+# /etc/nginx/conf.d/vllm.conf yourself and skip the script's nginx step.
+#
+# Upstreams point at LOCALHOST ports — the 6 vLLM replicas are plain processes in
+# THIS container (no docker DNS names like the compose variant uses).
+#
+# Auth model (differs from repo-root nginx): we do NOT inject `Authorization`.
+# vast.ai exposes ports on a SHARED public IP with no TLS, so the endpoint must
+# stay authenticated — clients send their own `Authorization: Bearer <API_KEY>`
+# and each vLLM replica validates it (--api-key). Do NOT add a proxy_set_header
+# Authorization line here unless the instance is firewalled/behind a VPN.
+
+upstream llm_backend {
+    least_conn;                       # long streaming requests → fewest-connections
+    server 127.0.0.1:18101 max_fails=3 fail_timeout=30s;   # llm-0  (GPU 0)
+    server 127.0.0.1:18102 max_fails=3 fail_timeout=30s;   # llm-1  (GPU 1)
+    keepalive 32;
+}
+
+upstream embedding_backend {
+    least_conn;
+    server 127.0.0.1:18001 max_fails=3 fail_timeout=30s;   # embedding-0 (GPU 0)
+    server 127.0.0.1:18002 max_fails=3 fail_timeout=30s;   # embedding-1 (GPU 1)
+    keepalive 16;
+}
+
+upstream reranker_backend {
+    least_conn;
+    server 127.0.0.1:18201 max_fails=3 fail_timeout=30s;   # reranker-0 (GPU 0)
+    server 127.0.0.1:18202 max_fails=3 fail_timeout=30s;   # reranker-1 (GPU 1)
+    keepalive 16;
+}
+
+# ── LLM :8001 (OpenAI-compatible, streaming) ─────────────────────────────────
+server {
+    listen 8001;
+    client_max_body_size 64M;
+    location / {
+        proxy_pass http://llm_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;                 # stream SSE chunks unbuffered
+        chunked_transfer_encoding on;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 600s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;         # one GPU down → retry the other
+    }
+}
+
+# ── Embedding :8000 ──────────────────────────────────────────────────────────
+server {
+    listen 8000;
+    client_max_body_size 64M;
+    location / {
+        proxy_pass http://embedding_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+    }
+}
+
+# ── Reranker :8002 (/v1/rerank, /v1/score) ───────────────────────────────────
+server {
+    listen 8002;
+    client_max_body_size 64M;
+    location / {
+        proxy_pass http://reranker_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+    }
+}

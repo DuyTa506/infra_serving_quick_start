@@ -18,6 +18,7 @@ tuỳ theo tài nguyên sẵn có — cùng port, cùng API, client không cần
 Có 2× RTX 6000 Pro (96 GB, Blackwell)?  →  Môi trường 1: GPU (production, nginx LB + monitoring)
 Chỉ có 1× RTX 6000 Pro, muốn bench?      →  Môi trường 1b: Single GPU (gọn, không nginx/monitoring)
 Có 2× A100 80GB (Ampere)?               →  Môi trường 1c: A100 (production, AWQ int4 + nginx LB + monitoring)
+Thuê 2× A100 trên vast.ai?              →  Môi trường 1d: vast.ai (template vLLM sẵn, AWQ int4 + nginx LB, không compose)
 Chỉ có Colab / cloud GPU đơn?           →  Môi trường 2: Colab
 Máy thường, không GPU?                  →  Môi trường 3: No-GPU + DeepSeek API
 ```
@@ -179,6 +180,34 @@ bash status.sh                # health + GPU; lần đầu tải LLM int4 ~18 GB
 > Stack A100 **dùng chung port + tên container** với môi trường 1 → chỉ chạy **một
 > trong hai** trên cùng host (1 host chỉ có 1 loại card). Cấu hình nginx + monitoring +
 > reranker template + HF cache được **tái dùng** từ repo root qua `../`. Chi tiết: `a100/README.md`.
+
+---
+
+## Môi trường 1d — vast.ai (2× A100 80GB, template vLLM dựng sẵn)
+
+Khi **thuê** 2× A100 trên [vast.ai](https://vast.ai). vast.ai instance **bản thân đã là một Docker
+container** nên **không chạy được `docker compose`** (cần Docker-in-Docker/`--privileged`, không được cấp).
+Thay vì compose, ta dùng **image vLLM dựng sẵn** (`vllm/vllm-openai:latest`) và **"flatten"** stack
+`a100/` thành **tiến trình** trong 1 container — cùng kiến trúc, **không build, không DinD**.
+
+```
+GPU 0 ── llm-0 (AWQ int4) ── embedding-0 ── reranker-0   ┐
+                                                         ├─► nginx LB ─► clients
+GPU 1 ── llm-1 (AWQ int4) ── embedding-1 ── reranker-1   ┘
+```
+
+Model **giống hệt môi trường 1c** (LLM `cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit` qua `awq_marlin`;
+`bge-m3` + `Qwen3-Reranker-0.6B` giữ nguyên). Một **on-start script** lo toàn bộ: launch 6 replica
+(pin GPU 0/1) + health-gate + nginx LB. **Giữ `--api-key`** (client gửi Bearer) vì port lộ trên IP
+công cộng dùng chung, không có TLS. **Không kèm Grafana/monitoring** (vốn là compose-based).
+
+**Khởi động:** tạo template vLLM (launch mode SSH), mở `-p 8001:8001 -p 8000:8000 -p 8002:8002`, đặt env
+`API_KEY`/`HF_TOKEN`, rồi dán bootstrap vào *On-start Script*:
+```bash
+git clone --depth 1 https://github.com/DuyTa506/infra_serving_quick_start.git /opt/iss || true
+bash /opt/iss/vast/on_start.sh
+```
+Chi tiết từng bước + verify + bảo mật: **`vast/README.md`**.
 
 ---
 
